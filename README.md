@@ -2,6 +2,8 @@
 
 **DriveClub for PS4 (version 1.28), running natively on Windows.**
 
+<img width="1920" height="1080" alt="s009 20" src="https://github.com/user-attachments/assets/4c0fe155-eae9-4c78-aa24-4a5b154e2b9f" />
+
 The source code is in this repository and the build is on the [Releases](../../releases) page.
 
 ## How to play
