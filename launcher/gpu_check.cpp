@@ -1,0 +1,265 @@
+// The renderer needs Vulkan 1.3 and a few extensions and features (the same list as the code that creates the
+// device). Without them the game would stop right after the start; this finds out first and says why. It only
+// refuses when it is sure: a driver that cannot be queried, that takes too long or that crashes is never a reason
+// to keep a player from starting.
+#define VK_NO_PROTOTYPES
+#include <vulkan/vulkan.h>
+
+#include <windows.h>
+
+#include <algorithm>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "gpu_check.h"
+
+namespace {
+
+std::wstring Widen(const char* text) {
+  const int n = MultiByteToWideChar(CP_UTF8, 0, text, -1, nullptr, 0);
+  if (n <= 1) return L"";
+  std::wstring w(size_t(n - 1), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, text, -1, w.data(), n);
+  return w;
+}
+
+std::string Narrow(const std::wstring& w) {
+  if (w.empty()) return "";
+  const int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), nullptr, 0, nullptr, nullptr);
+  std::string s(size_t(n), '\0');
+  WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), s.data(), n, nullptr, nullptr);
+  return s;
+}
+
+struct Candidate {
+  VkPhysicalDevice handle{};
+  VkPhysicalDeviceProperties props{};
+  unsigned long long local_memory = 0;
+  int index = 0;  // position in the driver's list: what BB_GPU_ID counts
+  std::wstring problem;  // "" when the card has everything
+  std::wstring name;
+};
+
+struct Outcome {
+  std::wstring message;  // "" fine, or when the check could not be completed
+  int use_index = -1;    // >= 0: the renderer must use this card
+};
+
+const wchar_t* kTail = L" Update the graphics driver; if it still does not run, this card is not supported."
+                       L" (To start anyway, turn on 'Skip the graphics card check' in the launcher.)";
+
+// What one card lacks, or "" when it has everything the renderer needs.
+std::wstring Problem(const Candidate& c, PFN_vkEnumerateDeviceExtensionProperties get_extensions,
+                     PFN_vkGetPhysicalDeviceFeatures2 get_features2, bool* certain) {
+  *certain = true;
+  if (c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU) return L"This is a software renderer, not a graphics card.";
+  if (c.props.apiVersion < VK_API_VERSION_1_3) {
+    const std::wstring have = std::to_wstring(VK_VERSION_MAJOR(c.props.apiVersion)) + L"." + std::to_wstring(VK_VERSION_MINOR(c.props.apiVersion));
+    return L"Your graphics card (" + c.name + L") offers Vulkan " + have + L", the game needs 1.3." + kTail;
+  }
+  uint32_t count = 0;
+  if (get_extensions(c.handle, nullptr, &count, nullptr) != VK_SUCCESS) { *certain = false; return L""; }
+  std::vector<VkExtensionProperties> extensions(count);
+  if (get_extensions(c.handle, nullptr, &count, extensions.data()) != VK_SUCCESS) { *certain = false; return L""; }
+  std::wstring missing;
+  const auto need = [&](const char* wanted) {
+    const bool has = std::any_of(extensions.begin(), extensions.end(),
+                                 [&](const VkExtensionProperties& e) { return std::strcmp(e.extensionName, wanted) == 0; });
+    if (!has) missing += (missing.empty() ? L"" : L", ") + Widen(wanted);
+  };
+  need("VK_KHR_swapchain");
+  need("VK_KHR_push_descriptor");
+  need("VK_EXT_vertex_attribute_divisor");
+  need("VK_EXT_robustness2");
+  if (!missing.empty()) {
+    return L"Your graphics card (" + c.name + L") lacks Vulkan extensions the game needs (" + missing + L")." + kTail;
+  }
+  VkPhysicalDeviceRobustness2FeaturesEXT robustness{};
+  robustness.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT;
+  VkPhysicalDeviceFeatures2 features{};
+  features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  features.pNext = &robustness;
+  get_features2(c.handle, &features);
+  if (!robustness.robustBufferAccess2) missing += L"robustBufferAccess2";
+  if (!robustness.robustImageAccess2) missing += (missing.empty() ? L"" : L", ") + std::wstring(L"robustImageAccess2");
+  if (!robustness.nullDescriptor) missing += (missing.empty() ? L"" : L", ") + std::wstring(L"nullDescriptor");
+  if (!missing.empty()) {
+    return L"Your graphics card (" + c.name + L") lacks Vulkan features the game needs (" + missing + L")." + kTail;
+  }
+  return L"";
+}
+
+Outcome Query() {
+  // To see how a refusal looks: set DRIVECLUB_FAKE_GPU_PROBLEM=1.
+  if (GetEnvironmentVariableW(L"DRIVECLUB_FAKE_GPU_PROBLEM", nullptr, 0) > 0) {
+    return {L"Your graphics card (Example GPU) lacks Vulkan features the game needs (robustBufferAccess2, nullDescriptor)." + std::wstring(kTail), -1};
+  }
+  HMODULE lib = LoadLibraryW(L"vulkan-1.dll");
+  if (!lib) {
+    return {L"No Vulkan graphics driver was found. Install or update your graphics driver (NVIDIA, AMD or Intel), then start the game again.", -1};
+  }
+  const auto get_instance_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(lib, "vkGetInstanceProcAddr"));
+  if (!get_instance_proc) return {};
+  const auto create_instance = reinterpret_cast<PFN_vkCreateInstance>(get_instance_proc(nullptr, "vkCreateInstance"));
+  if (!create_instance) return {};
+
+  VkApplicationInfo app{};
+  app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+  app.pApplicationName = "DriveClub";
+  app.apiVersion = VK_API_VERSION_1_1;
+  VkInstanceCreateInfo info{};
+  info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
+  info.pApplicationInfo = &app;
+  VkInstance instance = nullptr;
+  if (create_instance(&info, nullptr, &instance) != VK_SUCCESS || !instance) return {};
+
+  const auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(get_instance_proc(instance, "vkEnumeratePhysicalDevices"));
+  const auto get_props = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(get_instance_proc(instance, "vkGetPhysicalDeviceProperties"));
+  const auto get_memory = reinterpret_cast<PFN_vkGetPhysicalDeviceMemoryProperties>(get_instance_proc(instance, "vkGetPhysicalDeviceMemoryProperties"));
+  const auto get_extensions = reinterpret_cast<PFN_vkEnumerateDeviceExtensionProperties>(get_instance_proc(instance, "vkEnumerateDeviceExtensionProperties"));
+  const auto get_features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(get_instance_proc(instance, "vkGetPhysicalDeviceFeatures2"));
+  if (!enumerate || !get_props || !get_memory || !get_extensions || !get_features2) return {};
+
+  uint32_t count = 0;
+  if (enumerate(instance, &count, nullptr) != VK_SUCCESS) return {};
+  if (count == 0) {
+    return {L"No graphics card with Vulkan support was found. Install or update your graphics driver, then start the game again.", -1};
+  }
+  std::vector<VkPhysicalDevice> handles(count);
+  if (enumerate(instance, &count, handles.data()) != VK_SUCCESS) return {};
+  handles.resize(count);
+
+  std::vector<Candidate> devices;
+  bool all_certain = true;
+  for (uint32_t i = 0; i < handles.size(); ++i) {
+    Candidate c;
+    c.handle = handles[i];
+    c.index = int(i);
+    get_props(c.handle, &c.props);
+    c.name = Widen(c.props.deviceName);
+    VkPhysicalDeviceMemoryProperties memory{};
+    get_memory(c.handle, &memory);
+    for (uint32_t h = 0; h < memory.memoryHeapCount; ++h) {
+      if (memory.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+        c.local_memory = std::max<unsigned long long>(c.local_memory, memory.memoryHeaps[h].size);
+      }
+    }
+    bool certain = true;
+    c.problem = Problem(c, get_extensions, get_features2, &certain);
+    all_certain = all_certain && certain;
+    devices.push_back(c);
+  }
+  // A card whose answer could not be read: do not refuse anybody on a guess.
+  if (!all_certain) return {};
+
+  // The renderer's order: a driver new enough first, then a discrete card, no software renderer, most video memory.
+  std::stable_sort(devices.begin(), devices.end(), [](const Candidate& a, const Candidate& b) {
+    const bool a_api = a.props.apiVersion >= VK_API_VERSION_1_3, b_api = b.props.apiVersion >= VK_API_VERSION_1_3;
+    if (a_api != b_api) return a_api;
+    const bool a_disc = a.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    const bool b_disc = b.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+    if (a_disc != b_disc) return a_disc;
+    const bool a_cpu = a.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU, b_cpu = b.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+    if (a_cpu != b_cpu) return b_cpu;
+    return a.local_memory > b.local_memory;
+  });
+
+  if (devices.front().problem.empty()) return {};  // the renderer's own choice is fine
+  // The renderer would pick a card that cannot run it: take the first one that can.
+  for (const Candidate& c : devices) {
+    if (c.problem.empty() && c.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) return {L"", c.index};
+  }
+  // Only software renderers: say so rather than blaming one of them.
+  const bool only_software = std::all_of(devices.begin(), devices.end(), [](const Candidate& c) {
+    return c.props.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+  });
+  if (only_software) {
+    return {L"Only a software renderer was found, no real graphics card. Install or update your graphics driver, then start the game again.", -1};
+  }
+  for (const Candidate& c : devices) {
+    if (c.props.deviceType != VK_PHYSICAL_DEVICE_TYPE_CPU) return {c.problem, -1};
+  }
+  return {};
+}
+
+bool FileExists(const std::wstring& path) { return GetFileAttributesW(path.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+std::wstring ExeDir() {
+  wchar_t path[MAX_PATH * 2];
+  const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH * 2);
+  std::wstring dir(path, n);
+  const size_t slash = dir.find_last_of(L"\\/");
+  return slash == std::wstring::npos ? L"." : dir.substr(0, slash);
+}
+
+}  // namespace
+
+int GpuCheckChildMain(const wchar_t* result_path) {
+  const Outcome outcome = Query();
+  std::string text;
+  if (outcome.message.empty()) {
+    text = "ok\n";
+    if (outcome.use_index >= 0) text += "index=" + std::to_string(outcome.use_index) + "\n";
+  } else {
+    text = "bad\n" + Narrow(outcome.message);
+  }
+  FILE* f = _wfopen(result_path, L"wb");
+  if (f) {
+    std::fwrite(text.data(), 1, text.size(), f);
+    std::fclose(f);
+  }
+  return outcome.message.empty() ? 0 : 1;
+}
+
+std::wstring CheckGpu() {
+  if (FileExists(ExeDir() + L"\\skip_gpu_check.txt") || GetEnvironmentVariableW(L"DRIVECLUB_SKIP_GPU_CHECK", nullptr, 0) > 0) {
+    return L"";
+  }
+  wchar_t temp[MAX_PATH];
+  if (!GetTempPathW(MAX_PATH, temp)) return L"";
+  const std::wstring result = std::wstring(temp) + L"driveclub_gpucheck_" + std::to_wstring(GetCurrentProcessId()) + L".txt";
+  DeleteFileW(result.c_str());
+
+  wchar_t self[MAX_PATH * 2];
+  const DWORD n = GetModuleFileNameW(nullptr, self, MAX_PATH * 2);
+  if (n == 0) return L"";
+  std::wstring command = L"\"" + std::wstring(self, n) + L"\" --gpu-check \"" + result + L"\"";
+  std::vector<wchar_t> buffer(command.begin(), command.end());
+  buffer.push_back(L'\0');
+  STARTUPINFOW si{sizeof(si)};
+  PROCESS_INFORMATION pi{};
+  if (!CreateProcessW(nullptr, buffer.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) return L"";
+  // A driver that hangs or crashes must not keep anyone from playing: no answer in time is no objection.
+  const DWORD waited = WaitForSingleObject(pi.hProcess, 8000);
+  DWORD code = 0xFFFFFFFF;
+  if (waited == WAIT_OBJECT_0) {
+    GetExitCodeProcess(pi.hProcess, &code);
+  } else {
+    TerminateProcess(pi.hProcess, 2);
+  }
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  if (waited != WAIT_OBJECT_0 || (code != 0 && code != 1)) {
+    DeleteFileW(result.c_str());
+    return L"";
+  }
+
+  std::string text;
+  if (FILE* f = _wfopen(result.c_str(), L"rb")) {
+    char chunk[512];
+    size_t got;
+    while ((got = std::fread(chunk, 1, sizeof chunk, f)) > 0) text.append(chunk, got);
+    std::fclose(f);
+  }
+  DeleteFileW(result.c_str());
+  if (text.rfind("bad\n", 0) == 0 && code == 1) return Widen(text.c_str() + 4);
+  if (text.rfind("ok\n", 0) == 0) {
+    const size_t at = text.find("index=");
+    if (at != std::string::npos && GetEnvironmentVariableW(L"BB_GPU_ID", nullptr, 0) == 0) {
+      SetEnvironmentVariableW(L"BB_GPU_ID", Widen(std::to_string(std::atoi(text.c_str() + at + 6)).c_str()).c_str());
+    }
+  }
+  return L"";
+}

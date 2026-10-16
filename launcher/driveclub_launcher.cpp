@@ -1,0 +1,1100 @@
+// DriveClub (PC) - launcher.
+//
+// One native window: the two game folders, the game patches, Play. The look follows a dark card layout
+// (rounded cards, pill switches, segmented choices, a footer with a red Play button).
+// Play prepares the game once (a few minutes the first time, seconds afterwards), then starts it; this
+// program closes. Settings live next to this program (launcher.ini, data\), nothing is installed.
+//
+// Only components that ship with Windows are used (user32, gdi32, GDI+, shell32, ole32), and the C++ runtime
+// is linked statically.
+//
+//   DriveClub.exe              launcher window
+//   DriveClub.exe --play       prepare if needed and start the game without a window
+
+#include <windows.h>
+#include <windowsx.h>
+#include <objbase.h>
+#include <shlobj.h>
+#include <shellapi.h>
+#include <objidl.h>
+#include <gdiplus.h>
+
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "gpu_check.h"
+#include "prepare.h"
+
+using namespace Gdiplus;
+
+namespace {
+
+// ------------------------------------------------------------------------------------------
+// look
+// ------------------------------------------------------------------------------------------
+const Color kBg(255, 16, 18, 22), kCard(255, 24, 27, 33), kCardLine(255, 38, 42, 51), kText(255, 232, 234, 237),
+    kMuted(255, 139, 147, 161), kTrack(255, 33, 37, 45), kTrackHover(255, 45, 50, 60), kAccent(255, 224, 64, 38),
+    kAccentHover(255, 240, 84, 58), kOff(255, 63, 69, 82), kWhite(255, 245, 246, 248), kOk(255, 90, 200, 120),
+    kWarn(255, 240, 170, 60), kBad(255, 240, 96, 84);
+
+constexpr float kMargin = 24.f, kGap = 18.f, kHeaderH = 92.f, kFooterH = 96.f, kPad = 22.f, kTitleH = 44.f;
+constexpr float kWinW = 960.f;
+
+// ------------------------------------------------------------------------------------------
+// model
+// ------------------------------------------------------------------------------------------
+enum class Kind { Segmented, Toggle };
+
+struct Ctl {
+  const wchar_t* label;
+  const wchar_t* hint;
+  Kind kind;
+  std::vector<std::wstring> items;     // segmented choices
+  std::vector<std::string> patches;    // patch name per choice ("" = none); a toggle uses patches[0]
+  int def = 0;                         // default choice (toggle: 1 = on)
+  int sel = 0;
+  RectF row{}, ctl{};
+};
+
+struct Card {
+  const wchar_t* title;
+  std::vector<int> ctls;
+  int column;
+  const wchar_t* note = nullptr;
+  RectF rect{};
+};
+
+std::vector<Ctl> g_c;
+std::vector<Card> g_cards;
+
+struct FolderRow {
+  const wchar_t* label;
+  const wchar_t* hint;
+  std::wstring path;
+  bool ok = false;
+  RectF row{}, browse{};
+};
+FolderRow g_folder[2];  // 0 = update, 1 = base game
+
+std::wstring g_home, g_data, g_runtime;
+HWND g_hwnd = nullptr;
+HWND g_edit = nullptr;  // the in-place box for the player name
+float g_scale = 1.f, g_content_h = 0;
+int g_hover_ctl = -1, g_hover_seg = -1, g_hover_btn = -1, g_hover_browse = -1, g_press_btn = -1;
+std::wstring g_status;
+std::wstring g_gpu_problem;  // from CheckGpu() at start; Play stays off while it is set, unless the check is skipped
+bool g_skip_gpu_check = false;  // "Skip the graphics card check" in the launcher (skip_gpu_check= in launcher.ini)
+bool GpuBlocked() { return !g_gpu_problem.empty() && !g_skip_gpu_check; }
+Color g_status_color = kMuted;
+RectF g_btn[3];  // reset, save, play
+const wchar_t* kBtnText[3] = {L"Reset to defaults", L"Save", L"Play"};
+std::atomic<bool> g_busy{false};
+std::atomic<int> g_progress{0};
+std::wstring g_progress_text;
+bool g_changed = false;
+
+// ------------------------------------------------------------------------------------------
+// text helpers
+// ------------------------------------------------------------------------------------------
+std::string Narrow(const std::wstring& w) {
+  if (w.empty()) return "";
+  int n = WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), nullptr, 0, nullptr, nullptr);
+  std::string s(n, '\0');
+  WideCharToMultiByte(CP_UTF8, 0, w.data(), int(w.size()), s.data(), n, nullptr, nullptr);
+  return s;
+}
+
+std::wstring Widen(const std::string& s) {
+  if (s.empty()) return L"";
+  int n = MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), nullptr, 0);
+  std::wstring w(n, L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, s.data(), int(s.size()), w.data(), n);
+  return w;
+}
+
+std::wstring Dir(const std::wstring& path) {
+  size_t i = path.find_last_of(L"\\/");
+  return i == std::wstring::npos ? L"." : path.substr(0, i);
+}
+
+bool Exists(const std::wstring& p) { return GetFileAttributesW(p.c_str()) != INVALID_FILE_ATTRIBUTES; }
+
+void MakeDirs(const std::wstring& path) {
+  for (size_t i = 3; i < path.size(); ++i) {
+    if (path[i] == L'\\') CreateDirectoryW(path.substr(0, i).c_str(), nullptr);
+  }
+  CreateDirectoryW(path.c_str(), nullptr);
+}
+
+std::vector<std::string> ReadLines(const std::wstring& path) {
+  std::vector<std::string> lines;
+  std::ifstream in(path.c_str(), std::ios::binary);
+  for (std::string line; std::getline(in, line);) {
+    while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+    lines.push_back(line);
+  }
+  return lines;
+}
+
+// ------------------------------------------------------------------------------------------
+// settings: launcher.ini (folders) and data\user\patches_enabled.txt (what the game applies)
+// ------------------------------------------------------------------------------------------
+std::wstring IniPath() { return g_home + L"\\launcher.ini"; }
+std::wstring SelectionPath() { return g_data + L"\\user\\patches_enabled.txt"; }
+
+// True when the first 64 KiB of the file contain the text.
+bool FileHas(const std::wstring& path, const char* text) {
+  std::ifstream in(path.c_str(), std::ios::binary);
+  std::string data(65536, '\0');
+  in.read(data.data(), std::streamsize(data.size()));
+  data.resize(size_t(in.gcount()));
+  return data.find(text) != std::string::npos;
+}
+
+// The base game dump has an eboot.bin and an sce_sys\param.sfo too, so the update folder is told apart by what
+// the base game has and it does not (game000.dat) and by its version (01.28 in param.sfo).
+void CheckFolders() {
+  const std::wstring& u = g_folder[0].path;
+  g_folder[0].ok = !u.empty() && Exists(u + L"\\eboot.bin") && Exists(u + L"\\sce_sys\\param.sfo") &&
+                   !Exists(u + L"\\game000.dat") && FileHas(u + L"\\sce_sys\\param.sfo", "CUSA00093") &&
+                   FileHas(u + L"\\sce_sys\\param.sfo", "01.28");
+  const std::wstring& b = g_folder[1].path;
+  g_folder[1].ok = !b.empty() && Exists(b + L"\\game000.dat") && FileHas(b + L"\\sce_sys\\param.sfo", "CUSA00093");
+}
+
+// Why a chosen folder is not accepted, in words a player can act on ("" when it is fine or not chosen yet).
+std::wstring FolderProblem(int which) {
+  const std::wstring& p = g_folder[which].path;
+  if (p.empty() || g_folder[which].ok) return L"";
+  if (!Exists(p)) return L"This folder does not exist (any more). Press Browse and choose it again.";
+  const bool eboot = Exists(p + L"\\eboot.bin"), base = Exists(p + L"\\game000.dat");
+  const bool sfo = Exists(p + L"\\sce_sys\\param.sfo");
+  if (which == 0) {
+    if (base) return L"This is the base game, not the update. Choose the v1.28 update folder here.";
+    if (!eboot || !sfo) return L"Not the update: no eboot.bin and sce_sys here. If it is a parent folder, open it and choose the folder inside.";
+    if (!FileHas(p + L"\\sce_sys\\param.sfo", "CUSA00093")) return L"This is another game, not DriveClub (CUSA00093). Choose the DriveClub v1.28 update.";
+    return L"This update is not version 1.28 (its sce_sys\\param.sfo has another version). Choose the v1.28 update dump.";
+  }
+  if (eboot && !base) return L"This is the update, not the base game. Choose the base game folder here (it contains game000.dat).";
+  if (base && !FileHas(p + L"\\sce_sys\\param.sfo", "CUSA00093")) return L"This is another game, not DriveClub (CUSA00093). Choose the DriveClub base game folder.";
+  return L"Not the base game: no game000.dat here. If it is a parent folder, open it and choose the folder inside.";
+}
+
+int mirror_saved = 0;  // "Mirror and reflection updates" choice, from launcher.ini
+std::wstring g_name = L"Player";  // in-game player name, from "name=" in launcher.ini
+int g_inres = -1, g_wide = -1, g_outres = -1, g_preset = -1, g_mirror = -1, g_fps = -1;
+bool unlocked_saved = false;  // "Unlocked" frame rate choice, from launcher.ini  // indices of the render resolution and widescreen choices
+
+void BuildModel() {
+  g_folder[0].label = L"Update folder (version 1.28)";
+  g_folder[0].hint = L"The DriveClub v1.28 update dump: the folder that contains eboot.bin.";
+  g_folder[1].label = L"Base game folder";
+  g_folder[1].hint = L"The DriveClub base game dump: the folder that contains game000.dat.";
+  auto seg = [](const wchar_t* label, const wchar_t* hint, std::vector<std::wstring> items,
+                std::vector<std::string> patches, int def) {
+    Ctl c{label, hint, Kind::Segmented, std::move(items), std::move(patches), def, def};
+    g_c.push_back(std::move(c));
+    return int(g_c.size()) - 1;
+  };
+  auto toggle = [](const wchar_t* label, const wchar_t* hint, const char* patch, bool def) {
+    Ctl c{label, hint, Kind::Toggle, {}, {patch}, def ? 1 : 0, def ? 1 : 0};
+    g_c.push_back(std::move(c));
+    return int(g_c.size()) - 1;
+  };
+  g_preset = seg(L"Performance preset",
+                 L"Picks the render and output sizes for your PC. Lower the preset if the game is slow; "
+                 L"you can still change each size below.",
+                 {L"Custom", L"Handheld", L"Low", L"Medium", L"High", L"Ultra"}, {"@preset", "", "", "", "", ""}, 0);
+  const int fps = (g_fps = int(g_c.size()), seg(L"Frame rate",
+                      L"60 FPS (deltatime) scales the game by elapsed time, so speed stays right if the frame rate dips. "
+                      L"Unlocked uses the same timing with no frame cap: the game runs as fast as your PC allows and the speed stays right. "
+                      L"Fixed tick uses the engine's own 60 Hz mode (works with every feature, speed follows the frame rate).",
+                      {L"30 FPS", L"60 FPS", L"60 FPS (fixed tick)", L"Unlocked"},
+                      {"", "60 FPS with deltatime", "60 FPS with fixed tickrate", "@unlocked"}, 1));
+  const int outres = (g_outres = int(g_c.size()), seg(L"Output resolution", L"The size of the picture on screen.",
+                         {L"Default", L"720p", L"1440p", L"1800p", L"4K", L"5K", L"8K"},
+                         {"", "720p [1280x720] Output resolution", "1440p [2560x1440] Output resolution",
+                          "1800p [3200x1800] Output resolution", "4K [3840x2160] Output resolution",
+                          "5K [5120x2880] Output resolution", "8K [7680x4320] Output resolution"},
+                         0));
+  const int inres = (g_inres = int(g_c.size()), seg(L"Render resolution",
+                        L"What the game draws internally. Sizes above 1080p use more memory; the needed memory patch is added for you.",
+                        {L"Default", L"720p", L"1440p", L"1800p", L"4K", L"8K"},
+                        {"", "720p [1280x720] Internal resolution", "1440p [2560x1440] Internal resolution [DEPTH BUG]",
+                         "1800p [3200x1800] Internal resolution [DEPTH BUG]", "4K [3840x2160] Internal resolution [DEPTH BUG]",
+                         "8K [7680x4320] Internal resolution [DEPTH BUG]"},
+                        00));
+  const int wide = (g_wide = int(g_c.size()), seg(L"Widescreen (render and output)",
+                       L"Ultrawide sizes. These change both the render and the output size. The needed memory patch is added for you.",
+                       {L"Off", L"21:9 2560x1080", L"32:9 3840x1080", L"21:9 3440x1440"},
+                       {"", "1080p 21:9 [2560x1080] Internal + Output resolution [DEPTH BUG]",
+                        "1080p 32:9 [3840x1080] Internal + Output resolution [DEPTH BUG]",
+                        "1440p 21:9 [3440x1440] Internal + Output resolution [DEPTH BUG]"},
+                       00));
+  const int fov = toggle(L"Widescreen field-of-view fix", L"For wide and ultrawide resolutions only.",
+                         "FOV fix for wide resolutions", false);
+  const int blur = toggle(L"Disable motion blur and depth of field",
+                          L"They share one shader, so both are turned off together.",
+                          "Disable motion blur and depth of field", false);
+  const int reset = toggle(L"No reset-to-track timer", L"Disables the reset to track timer.", "Reset Disable", false);
+  const int barrier = toggle(L"Disable track barriers", L"Removes the invisible barriers at the track edges.",
+                             "Barrier Disable", false);
+  const int pcol = toggle(L"Photo mode: free camera through cars",
+                          L"Disables car collision with the free camera, so you can look inside any car.",
+                          "Disable Photomode Free Camera Collision", false);
+  const int pproc = toggle(L"Photo mode: skip processing", L"Disables photo mode processing.",
+                           "Disable Photomode Processing", false);
+  const int pname = seg(L"Player name", L"The name the game shows for you. Click it to type a new one.", {g_name}, {"@name"}, 0);
+  g_mirror = seg(L"Mirror and reflection updates",
+                 L"The game draws a second small scene (the mirrors, rain and reflections) every frame, about a quarter of all draw calls. "
+                 L"Static draws it once and keeps that picture: much faster and steady, but reflections and rain on the glass stop updating.",
+                 {L"Live", L"Static (faster)"}, {"@mirror", ""}, 0);
+  const int skipgpu = toggle(L"Skip the graphics card check",
+                             L"The launcher checks that your graphics card can run the game (Vulkan 1.3). If it refuses a card that does work, turn this on to start anyway.",
+                             "@skipgpu", false);
+  const int showfps = toggle(L"Show FPS counter", L"Draws the frame rate in the top right corner while playing.", "@fps", false);
+  const int full = toggle(L"Fullscreen", L"Plays borderless fullscreen. Turn off for a window.", "@full", true);
+  g_cards.push_back({L"FRAME RATE AND RESOLUTION", {g_preset, fps, outres, inres, wide, fov}, 0});
+  g_cards.push_back({L"GAMEPLAY", {pname, g_mirror, full, showfps, blur, reset, barrier, pcol, pproc, skipgpu}, 1,
+                     L"Community patches for DriveClub version 1.28."});
+}
+
+bool fps_counter = false, fast_render = false, full_screen = true;  // the settings that are not patches
+
+// Output / render choices per preset: indices into the "Output resolution" and "Render resolution" rows,
+// and the "Mirror and reflection updates" choice (slower presets update the mirrors less often).
+const int kPresetOut[6] = {0, 1, 0, 2, 4, 4};     // Default 720p 1440p 1800p 4K 5K 8K
+const int kPresetIn[6] = {0, 1, 1, 0, 2, 4};      // Default(1080p) 720p 1440p 1800p 4K 8K
+const int kPresetMirror[6] = {0, 1, 0, 0, 0, 0};  // Live, Static (Handheld takes the speed)
+
+// The preset row has no patch of its own: it shows the preset whose sizes are selected, else Custom.
+void DerivePreset() {
+  if (g_preset < 0 || g_outres < 0 || g_inres < 0) return;
+  g_c[g_preset].sel = 0;
+  if (g_wide >= 0 && g_c[g_wide].sel != 0) return;
+  for (int p = 1; p <= 5; ++p) {
+    if (g_c[g_outres].sel == kPresetOut[p] && g_c[g_inres].sel == kPresetIn[p]) g_c[g_preset].sel = p;
+  }
+}
+
+void LoadSettings() {
+  for (const auto& line : ReadLines(IniPath())) {
+    if (line.rfind("update=", 0) == 0) g_folder[0].path = Widen(line.substr(7));
+    if (line.rfind("base=", 0) == 0) g_folder[1].path = Widen(line.substr(5));
+    if (line.rfind("fps=", 0) == 0) fps_counter = line.substr(4) == "1";
+    if (line.rfind("fast=", 0) == 0) fast_render = line.substr(5) == "1";
+    if (line.rfind("name=", 0) == 0) g_name = Widen(line.substr(5));
+    if (line.rfind("mirror=", 0) == 0) mirror_saved = atoi(line.substr(7).c_str());
+    if (line.rfind("unlocked=", 0) == 0) unlocked_saved = line.substr(9) == "1";
+    if (line.rfind("skip_gpu_check=", 0) == 0) g_skip_gpu_check = line.substr(15) == "1";
+    if (line.rfind("full=", 0) == 0) full_screen = line.substr(5) == "1";
+  }
+  for (auto& c : g_c) if (c.patches[0] == "@name") c.items[0] = g_name;
+  CheckFolders();
+  const auto lines = ReadLines(SelectionPath());
+  const bool has_selection = !lines.empty() || Exists(SelectionPath());
+  for (auto& c : g_c) {
+    if (c.kind == Kind::Toggle && c.patches[0] == "@fps") {
+      c.sel = fps_counter ? 1 : 0;
+      continue;
+    }
+    if (c.kind == Kind::Toggle && c.patches[0] == "@fast") {
+      c.sel = fast_render ? 1 : 0;
+      continue;
+    }
+    if (c.kind == Kind::Toggle && c.patches[0] == "@skipgpu") {
+      c.sel = g_skip_gpu_check ? 1 : 0;
+      continue;
+    }
+    if (c.kind == Kind::Toggle && c.patches[0] == "@full") {
+      c.sel = full_screen ? 1 : 0;
+      continue;
+    }
+    if (!has_selection) continue;  // defaults
+    c.sel = 0;
+    for (size_t i = 0; i < c.patches.size(); ++i) {
+      if (c.patches[i].empty()) continue;
+      if (std::find(lines.begin(), lines.end(), c.patches[i]) != lines.end()) c.sel = c.kind == Kind::Toggle ? 1 : int(i);
+    }
+  }
+  // After the loop above, which resets every row that has no patch of its own.
+  if (g_mirror >= 0 && mirror_saved == 1) g_c[g_mirror].sel = mirror_saved;
+  if (g_fps >= 0 && unlocked_saved && g_c[g_fps].sel == 1) g_c[g_fps].sel = 3;  // Unlocked is deltatime without the cap
+  DerivePreset();
+}
+
+// Resolutions above 1080p need more memory: the game's own "Memory for up to ..." patch plus a larger
+// direct memory budget. 0 = default, 1 = up to 1440p, 2 = up to 4K.
+bool full_screen_now() {
+  for (const auto& c : g_c) {
+    if (c.kind == Kind::Toggle && c.patches[0] == "@full") return c.sel != 0;
+  }
+  return true;
+}
+
+int MemoryTier() {
+  if (g_inres < 0 || g_wide < 0) return 0;
+  const int r = g_c[g_inres].sel, w = g_c[g_wide].sel;  // render: Default 720p 1440p 1800p 4K; wide: Off + 3 sizes
+  if (r >= 5) return 3;
+  if (w > 0 || r >= 3) return 2;
+  return r == 2 ? 1 : 0;
+}
+
+// Output / render choices per preset: indices into the "Output resolution" and "Render resolution" rows.
+void ApplyPreset(int preset) {
+  if (preset <= 0 || preset > 5 || g_outres < 0 || g_inres < 0) return;
+  g_c[g_outres].sel = kPresetOut[preset];
+  g_c[g_inres].sel = kPresetIn[preset];
+  if (g_wide >= 0) g_c[g_wide].sel = 0;
+  if (g_mirror >= 0) g_c[g_mirror].sel = kPresetMirror[preset];
+}
+
+void SaveSettings() {
+  MakeDirs(g_data + L"\\user");
+  {
+    std::ofstream ini(IniPath().c_str(), std::ios::binary | std::ios::trunc);
+    bool fps_on = false, fast_on = false, full_on = true;
+    for (const auto& c : g_c) {
+      if (c.kind == Kind::Toggle && c.patches[0] == "@fps") fps_on = c.sel != 0;
+      if (c.kind == Kind::Toggle && c.patches[0] == "@fast") fast_on = c.sel != 0;
+      if (c.kind == Kind::Toggle && c.patches[0] == "@full") full_on = c.sel != 0;
+    }
+    ini << "update=" << Narrow(g_folder[0].path) << "\r\nbase=" << Narrow(g_folder[1].path) << "\r\nfps=" << (fps_on ? 1 : 0)
+        << "\r\nfast=" << (fast_on ? 1 : 0) << "\r\nunlocked=" << ((g_fps >= 0 && g_c[g_fps].sel == 3) ? 1 : 0) << "\r\nskip_gpu_check=" << (g_skip_gpu_check ? 1 : 0) << "\r\nmirror=" << (g_mirror >= 0 ? g_c[g_mirror].sel : 0) << "\r\nname=" << Narrow(g_name) <<"\r\nfull=" << (full_on ? 1 : 0) << "\r\n";
+    // The renderer optimizations that are switched off, as a bit mask. The draw thread is bit 37.
+    const std::wstring toggles = g_data + L"\\user\\toggles.txt";
+    std::ofstream tog(toggles.c_str(), std::ios::binary | std::ios::trunc);
+    tog << "137439506432";  // the renderer's experimental two-thread draw path stays off
+    const std::wstring game_ini = g_data + L"\\user\\driveclub.ini";
+    std::ofstream game(game_ini.c_str(), std::ios::binary | std::ios::trunc);
+    game << "show_fps=" << (fps_on ? 1 : 0) << "\r\n";
+  }
+  std::ofstream out(SelectionPath().c_str(), std::ios::binary | std::ios::trunc);
+  for (const auto& c : g_c) {
+    if (c.kind == Kind::Toggle) {
+      if (c.sel && c.patches[0][0] != '@') out << c.patches[0] << "\n";
+    } else if (c.sel > 0 && c.patches[c.sel] == "@unlocked") {
+      out << "60 FPS with deltatime\n";  // the same timing patch; only the frame cap differs
+    } else if (c.sel > 0 && !c.patches[c.sel].empty() && c.patches[c.sel][0] != '@') {
+      out << c.patches[c.sel] << "\n";
+    }
+  }
+  if (MemoryTier() == 1) out << "Memory for up to 1440p\n";
+  if (MemoryTier() == 2) out << "Memory for up to 4K\n";
+  if (MemoryTier() == 3) out << "Memory for up to 8K\n";
+  g_changed = false;
+}
+
+void ResetDefaults() {
+  for (auto& c : g_c) {
+    c.sel = c.def;
+    if (c.kind == Kind::Toggle && c.patches[0] == "@skipgpu") g_skip_gpu_check = c.sel != 0;
+  }
+  g_changed = true;
+}
+
+// ------------------------------------------------------------------------------------------
+// layout
+// ------------------------------------------------------------------------------------------
+float RowHeight(const Ctl& c) { return c.kind == Kind::Toggle ? 46.f : 70.f; }
+float FolderRowHeight() { return 74.f; }
+
+void Layout() {
+  const float colw = (kWinW - 2 * kMargin - kGap) / 2.f;
+  // game folders: a full-width card on top
+  const float folders_h = kTitleH + 2 * FolderRowHeight() + kPad * 0.4f + 8.f;
+  const RectF folders_rect(kMargin, kHeaderH, kWinW - 2 * kMargin, folders_h);
+  float fy = folders_rect.Y + kTitleH;
+  for (auto& f : g_folder) {
+    f.row = RectF(folders_rect.X + kPad, fy, folders_rect.Width - 2 * kPad, FolderRowHeight());
+    f.browse = RectF(f.row.X + f.row.Width - 104.f, fy + 24.f, 104.f, 36.f);
+    fy += FolderRowHeight();
+  }
+  float y[2] = {kHeaderH + folders_h + kGap, kHeaderH + folders_h + kGap};
+  for (auto& card : g_cards) {
+    float h = kTitleH + kPad * 0.4f;
+    for (int i : card.ctls) h += RowHeight(g_c[i]);
+    h += kPad * 0.6f;
+    if (card.note) h += 46.f;
+    card.rect = RectF(kMargin + card.column * (colw + kGap), y[card.column], colw, h);
+    float cy = y[card.column] + kTitleH + kPad * 0.4f;
+    for (int i : card.ctls) {
+      Ctl& c = g_c[i];
+      const float rh = RowHeight(c);
+      c.row = RectF(card.rect.X + kPad, cy, colw - 2 * kPad, rh);
+      c.ctl = c.kind == Kind::Toggle ? RectF(c.row.X + c.row.Width - 46.f, cy + 10.f, 46.f, 26.f)
+                                     : RectF(c.row.X, cy + 26.f, c.row.Width, 34.f);
+      cy += rh;
+    }
+    y[card.column] += h + kGap;
+  }
+  const float bottom = (std::max)(y[0], y[1]) - kGap;
+  for (int col = 0; col < 2; ++col) {
+    for (int k = int(g_cards.size()) - 1; k >= 0; --k) {
+      if (g_cards[k].column != col) continue;
+      g_cards[k].rect.Height += bottom - (y[col] - kGap);
+      break;
+    }
+  }
+  g_content_h = bottom + kGap;
+  const float bar_y = g_content_h + 2.f;
+  const float bw[3] = {170.f, 110.f, 130.f};
+  float x = kWinW - kMargin;
+  for (int i = 2; i >= 0; --i) {
+    x -= bw[i];
+    g_btn[i] = RectF(x, bar_y + 14.f, bw[i], 44.f);
+    x -= 12.f;
+  }
+}
+
+float TotalHeight() { return g_content_h + kFooterH; }
+
+// ------------------------------------------------------------------------------------------
+// painting
+// ------------------------------------------------------------------------------------------
+GraphicsPath* Round(const RectF& r, float rad) {
+  auto* p = new GraphicsPath();
+  const float d = rad * 2;
+  p->AddArc(r.X, r.Y, d, d, 180, 90);
+  p->AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
+  p->AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90);
+  p->AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
+  p->CloseFigure();
+  return p;
+}
+
+void FillRound(Graphics& g, const RectF& r, float rad, const Color& c) {
+  SolidBrush br(c);
+  GraphicsPath* p = Round(r, rad);
+  g.FillPath(&br, p);
+  delete p;
+}
+
+void StrokeRound(Graphics& g, const RectF& r, float rad, const Color& c, float w = 1.f) {
+  Pen pen(c, w);
+  GraphicsPath* p = Round(r, rad);
+  g.DrawPath(&pen, p);
+  delete p;
+}
+
+void Text(Graphics& g, const std::wstring& s, const Font& f, const RectF& r, const Color& c,
+          StringAlignment h = StringAlignmentNear, StringAlignment v = StringAlignmentCenter, bool wrap = false,
+          bool ellipsis = true) {
+  StringFormat fmt;
+  fmt.SetAlignment(h);
+  fmt.SetLineAlignment(v);
+  if (!wrap) fmt.SetFormatFlags(StringFormatFlagsNoWrap);
+  fmt.SetTrimming(ellipsis ? StringTrimmingEllipsisCharacter : StringTrimmingNone);
+  SolidBrush br(c);
+  g.DrawString(s.c_str(), -1, &f, r, &fmt, &br);
+}
+
+RectF Scaled(const RectF& r) { return RectF(r.X * g_scale, r.Y * g_scale, r.Width * g_scale, r.Height * g_scale); }
+
+bool FoldersOk() { return g_folder[0].ok && g_folder[1].ok; }
+
+void Paint(HDC hdc, int w, int h) {
+  Graphics g(hdc);
+  g.SetSmoothingMode(SmoothingModeAntiAlias);
+  g.SetTextRenderingHint(TextRenderingHintClearTypeGridFit);
+  g.Clear(kBg);
+  FontFamily fam(L"Segoe UI");
+  const float S = g_scale;
+  Font fTitle(&fam, 22 * S, FontStyleBold, UnitPixel), fSub(&fam, 13 * S, FontStyleRegular, UnitPixel),
+      fCard(&fam, 12 * S, FontStyleBold, UnitPixel), fLabel(&fam, 14 * S, FontStyleRegular, UnitPixel),
+      fSegBold(&fam, 13 * S, FontStyleBold, UnitPixel), fHint(&fam, 12.5f * S, FontStyleRegular, UnitPixel),
+      fBtn(&fam, 14 * S, FontStyleBold, UnitPixel), fSeg(&fam, 13 * S, FontStyleRegular, UnitPixel);
+
+  // header
+  FillRound(g, Scaled(RectF(kMargin, 26, 8, 40)), 3 * S, kAccent);
+  Text(g, L"DRIVECLUB", fTitle, Scaled(RectF(kMargin + 22, 20, 520, 32)), kText);
+  Text(g, L"PC  -  game folders and patches", fSub, Scaled(RectF(kMargin + 22, 50, 520, 22)), kMuted);
+  {
+    const bool folder_problem = !FolderProblem(0).empty() || !FolderProblem(1).empty();
+    const wchar_t* chip = GpuBlocked() ? L"Graphics card not supported"
+                          : FoldersOk() ? L"Game found" : folder_problem ? L"Check the game folders" : L"Choose the game folders";
+    StringFormat measure(StringFormat::GenericTypographic());
+    measure.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsMeasureTrailingSpaces);
+    RectF box;
+    g.MeasureString(chip, -1, &fSeg, PointF(0, 0), &measure, &box);
+    const float cw = box.Width / S + 52.f;
+    RectF cr = Scaled(RectF(kWinW - kMargin - cw, 32, cw, 30));
+    const bool chip_ok = FoldersOk() && !GpuBlocked();
+    FillRound(g, cr, 15 * S, chip_ok ? Color(255, 28, 52, 38) : Color(255, 60, 40, 28));
+    SolidBrush dot(chip_ok ? kOk : kWarn);
+    g.FillEllipse(&dot, cr.X + 13 * S, cr.Y + 11 * S, 8 * S, 8 * S);
+    Text(g, chip, fSeg, RectF(cr.X + 30 * S, cr.Y, cr.Width - 30 * S, cr.Height), chip_ok ? kOk : kWarn,
+         StringAlignmentNear, StringAlignmentCenter, false, false);
+  }
+
+  // game folders card
+  {
+    const RectF cr = Scaled(RectF(kMargin, kHeaderH, kWinW - 2 * kMargin, kTitleH + 2 * FolderRowHeight() + kPad * 0.4f + 8.f));
+    FillRound(g, cr, 12 * S, kCard);
+    StrokeRound(g, cr, 12 * S, kCardLine);
+    Text(g, L"GAME FILES", fCard, RectF(cr.X + kPad * S, cr.Y + 6 * S, cr.Width - 2 * kPad * S, (kTitleH - 6) * S), kMuted);
+    for (int i = 0; i < 2; ++i) {
+      const FolderRow& f = g_folder[i];
+      const RectF row = Scaled(f.row), br = Scaled(f.browse);
+      Text(g, f.label, fLabel, RectF(row.X, row.Y + 4 * S, row.Width - 130 * S, 22 * S), kText);
+      SolidBrush dot(f.ok ? kOk : (f.path.empty() ? kOff : kWarn));
+      g.FillEllipse(&dot, row.X, row.Y + 38 * S, 8 * S, 8 * S);
+      const std::wstring shown = f.path.empty() ? std::wstring(L"Not chosen yet") : f.path;
+      Text(g, shown, fHint, RectF(row.X + 16 * S, row.Y + 28 * S, row.Width - 130 * S, 28 * S),
+           f.path.empty() ? kMuted : kText);
+      if (const std::wstring problem = FolderProblem(i); !problem.empty()) {
+        SolidBrush bad(kBad);
+        g.FillEllipse(&bad, row.X, row.Y + 38 * S, 8 * S, 8 * S);
+        Text(g, problem, fHint, RectF(row.X + 16 * S, row.Y + 50 * S, row.Width - 130 * S, 22 * S), kBad);
+      }
+      const bool over = g_hover_browse == i;
+      FillRound(g, br, 10 * S, over ? Color(255, 66, 73, 88) : Color(255, 50, 56, 68));
+      Text(g, L"Browse...", fBtn, br, kWhite, StringAlignmentCenter);
+    }
+  }
+
+  // cards
+  for (auto& card : g_cards) {
+    RectF cr = Scaled(card.rect);
+    FillRound(g, cr, 12 * S, kCard);
+    StrokeRound(g, cr, 12 * S, kCardLine);
+    Text(g, card.title, fCard, RectF(cr.X + kPad * S, cr.Y + 6 * S, cr.Width - 2 * kPad * S, (kTitleH - 6) * S), kMuted);
+    if (card.note) {
+      Text(g, card.note, fHint, RectF(cr.X + kPad * S, cr.Y + cr.Height - 54 * S, cr.Width - 2 * kPad * S, 44 * S), kMuted,
+           StringAlignmentNear, StringAlignmentFar, true);
+    }
+    for (int i : card.ctls) {
+      Ctl& c = g_c[i];
+      const RectF row = Scaled(c.row), ct = Scaled(c.ctl);
+      const bool hot = g_hover_ctl == i;
+      if (c.kind == Kind::Toggle) {
+        Text(g, c.label, fLabel, RectF(row.X, row.Y + 2 * S, row.Width - 60 * S, 40 * S), kText);
+        FillRound(g, ct, ct.Height / 2, c.sel ? (hot ? kAccentHover : kAccent) : (hot ? Color(255, 80, 87, 102) : kOff));
+        SolidBrush knob(kWhite);
+        const float d = ct.Height - 6 * S;
+        g.FillEllipse(&knob, c.sel ? ct.X + ct.Width - d - 3 * S : ct.X + 3 * S, ct.Y + 3 * S, d, d);
+      } else {
+        Text(g, c.label, fLabel, RectF(row.X, row.Y + 2 * S, row.Width, 22 * S), kText);
+        FillRound(g, ct, 9 * S, kTrack);
+        const float sw = ct.Width / float(c.items.size());
+        for (size_t k = 0; k < c.items.size(); ++k) {
+          RectF seg(ct.X + sw * k + 3 * S, ct.Y + 3 * S, sw - 6 * S, ct.Height - 6 * S);
+          const bool sel = int(k) == c.sel;
+          const bool over = hot && g_hover_seg == int(k);
+          if (sel) FillRound(g, seg, 7 * S, over ? kAccentHover : kAccent);
+          else if (over) FillRound(g, seg, 7 * S, kTrackHover);
+          float px = 13.f;
+          StringFormat mf;
+          mf.SetFormatFlags(StringFormatFlagsNoWrap);
+          for (; px > 9.f; px -= 0.5f) {
+            Font ft(&fam, px * S, sel ? FontStyleBold : FontStyleRegular, UnitPixel);
+            RectF bx;
+            g.MeasureString(c.items[k].c_str(), -1, &ft, PointF(0, 0), &mf, &bx);
+            if (bx.Width <= seg.Width - 8 * S) break;
+          }
+          Font fit(&fam, px * S, sel ? FontStyleBold : FontStyleRegular, UnitPixel);
+          Text(g, c.items[k], fit, seg, sel ? kWhite : kMuted, StringAlignmentCenter);
+        }
+      }
+    }
+  }
+
+  // footer: hint / status / progress, buttons
+  const float fy = g_content_h * S;
+  SolidBrush footer_brush(Color(255, 12, 13, 16));
+  g.FillRectangle(&footer_brush, 0.f, fy, float(w), float(h) - fy);
+  std::wstring msg = g_status;
+  Color mc = g_status_color;
+  if (g_busy) {
+    msg = g_progress_text;
+    mc = kText;
+  } else if (g_hover_ctl >= 0) {
+    msg = g_c[g_hover_ctl].hint;
+    mc = kMuted;
+  } else if (g_hover_browse >= 0) {
+    msg = g_folder[g_hover_browse].hint;
+    mc = kMuted;
+  } else if (g_hover_btn == 0) {
+    msg = L"Put every patch back to its default.";
+    mc = kMuted;
+  } else if (g_hover_btn == 2) {
+    msg = FoldersOk() ? L"Save and start the game." : L"Choose both game folders first.";
+    mc = kMuted;
+  }
+  {
+    const RectF fr(kMargin * S, fy + 8 * S, (g_btn[0].X - kMargin - 12) * S, (kFooterH - 16) * S);
+    StringFormat mfmt;
+    mfmt.SetTrimming(StringTrimmingNone);
+    float px = 12.5f;
+    for (; px > 9.f; px -= 0.5f) {
+      Font ft(&fam, px * S, FontStyleRegular, UnitPixel);
+      RectF bounds;
+      g.MeasureString(msg.c_str(), -1, &ft, RectF(0, 0, fr.Width, 0), &mfmt, &bounds);
+      if (bounds.Height <= fr.Height) break;
+    }
+    Font fit(&fam, px * S, FontStyleRegular, UnitPixel);
+    Text(g, msg, fit, fr, mc, StringAlignmentNear, StringAlignmentCenter, true, false);
+  }
+  if (g_busy) {
+    const RectF bar = Scaled(RectF(kMargin, g_content_h + kFooterH - 18.f, g_btn[0].X - kMargin - 12, 6.f));
+    FillRound(g, bar, 3 * S, kTrack);
+    FillRound(g, RectF(bar.X, bar.Y, bar.Width * float(g_progress.load()) / 100.f, bar.Height), 3 * S, kAccent);
+  }
+  for (int i = 0; i < 3; ++i) {
+    RectF br = Scaled(g_btn[i]);
+    const bool over = g_hover_btn == i && !g_busy, down = g_press_btn == i && over;
+    const bool disabled = (i == 2 && (!FoldersOk() || GpuBlocked())) || g_busy;
+    Color fill = i == 2 ? (disabled ? kOff : (down ? Color(255, 200, 52, 30) : over ? kAccentHover : kAccent))
+                        : (i == 1 ? (down ? Color(255, 56, 62, 74) : over ? Color(255, 66, 73, 88) : Color(255, 50, 56, 68))
+                                  : (over ? kTrackHover : kTrack));
+    FillRound(g, br, 10 * S, fill);
+    Text(g, kBtnText[i], fBtn, br, disabled ? kMuted : kWhite, StringAlignmentCenter);
+  }
+}
+
+// ------------------------------------------------------------------------------------------
+// preparing and starting the game
+// ------------------------------------------------------------------------------------------
+std::wstring PatchXmlPath() {
+  const std::wstring bundled = g_runtime + L"\\patches\\DriveClub.xml";
+  return Exists(bundled) ? bundled : g_home + L"\\..\\..\\patches\\DriveClub.xml";  // development tree
+}
+
+std::wstring GameExe() {
+  const std::wstring bundled = g_runtime + L"\\DriveClubGame.exe";
+  return Exists(bundled) ? bundled : g_home + L"\\..\\DriveClubGame.exe";
+}
+
+void SetProgress(int percent, const std::wstring& text) {
+  g_progress = percent;
+  g_progress_text = text;
+  if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 1, 0, 0);
+}
+
+// Prepares the game from the two dumps (a few seconds the first time). Returns "" on success, else the error.
+std::wstring RunPrepare() {
+  const std::wstring stamp_path = g_data + L"\\prep\\stamp.txt";
+  const std::wstring stamp_now = g_folder[0].path + L"|" + g_folder[1].path;
+  std::wstring stamp_old;
+  for (const auto& l : ReadLines(stamp_path)) stamp_old = Widen(l);
+  const bool ready = Exists(g_data + L"\\prep\\boot-linked.bin") && Exists(g_data + L"\\prep\\image.meta");
+  const bool patches_only = ready && stamp_old == stamp_now;
+  const std::string error = PrepareGame(
+      std::filesystem::path(g_folder[0].path), std::filesystem::path(g_folder[1].path), std::filesystem::path(g_data),
+      std::filesystem::path(PatchXmlPath()), patches_only, [](int step, const std::string& text) {
+        SetProgress(step * 100 / 6, Widen(text));
+      });
+  if (!error.empty()) return Widen(error);
+  std::ofstream out(stamp_path.c_str(), std::ios::binary | std::ios::trunc);
+  out << Narrow(stamp_now);
+  return L"";
+}
+
+std::wstring Timestamp() {
+  SYSTEMTIME t;
+  GetLocalTime(&t);
+  wchar_t b[40];
+  wsprintfW(b, L"%04d%02d%02d_%02d%02d%02d", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond);
+  return b;
+}
+
+std::wstring StartGame() {
+  const std::wstring exe = GameExe();
+  if (!Exists(exe)) return L"The game program (DriveClubGame.exe) was not found.";
+  MakeDirs(g_home + L"\\logs");
+  SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
+  HANDLE log = CreateFileW((g_home + L"\\logs\\driveclub_" + Timestamp() + L".log").c_str(), GENERIC_WRITE, FILE_SHARE_READ,
+                           &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  const std::wstring prep = g_data + L"\\prep", user = g_data + L"\\user";
+  std::wstring cmd = L"\"" + exe + L"\" \"" + prep + L"\\boot-linked.bin\" --content-profile \"" + prep +
+                     L"\\content.bin\" --patches \"" + prep + L"\\patches.bin\" --app0 \"" + g_folder[0].path +
+                     L"\" --app0-base \"" + g_folder[1].path + L"\" --user \"" + user + L"\" --stub-unresolved";
+  SetEnvironmentVariableW(L"BB_GPU_USER_DIR", user.c_str());
+  {
+    // With the deltatime patch the game times itself by the wall clock, so each frame must be shown as soon as
+    // it is finished; waiting for the next 60 Hz tick alternates 16 and 33 ms frames and shakes the camera.
+    bool delta = false;
+    for (const Ctl& c : g_c) {
+      if (c.kind == Kind::Segmented && c.sel > 0 && c.sel < int(c.patches.size()) && c.patches[c.sel] == "60 FPS with deltatime") delta = true;
+    }
+    // Unlocked: every frame is shown at once (1 ms spacing is no cap in practice); the deltatime patch keeps the game speed right.
+    const bool unlocked = g_fps >= 0 && g_c[g_fps].sel == 3;
+    SetEnvironmentVariableW(L"BB_FPS_LIMIT", unlocked ? L"1000" : delta ? L"60" : nullptr);
+  }
+  if (g_mirror >= 0) {
+    SetEnvironmentVariableW(L"BB_MIRROR_RATE", g_c[g_mirror].sel == 1 ? L"0" : L"1");
+    // Diagnostics only: DRIVECLUB_MIRROR_RATE=<n> overrides the choice above (0: the scene is drawn once and then kept).
+    wchar_t forced[16];
+    if (GetEnvironmentVariableW(L"DRIVECLUB_MIRROR_RATE", forced, 16) > 0) SetEnvironmentVariableW(L"BB_MIRROR_RATE", forced);
+  }
+  SetEnvironmentVariableW(L"BB_USER_NAME", g_name.c_str());
+  SetEnvironmentVariableW(L"BB_FULLSCREEN", full_screen_now() ? L"1" : L"0");
+  SetEnvironmentVariableW(L"BB_TOGGLE_FILE", (user + L"\\toggles.txt").c_str());
+  const int tier = MemoryTier();
+  SetEnvironmentVariableW(L"BB_DMEM_MB", tier == 3 ? L"17056" : tier == 2 ? L"10056" : tier == 1 ? L"8056" : L"5056");
+  SetEnvironmentVariableW(L"BB_CONFIG", (user + L"\\driveclub.ini").c_str());
+  STARTUPINFOW si{sizeof(si)};
+  si.dwFlags = STARTF_USESTDHANDLES;
+  si.hStdOutput = log;
+  si.hStdError = log;
+  si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+  PROCESS_INFORMATION pi{};
+  std::vector<wchar_t> buf(cmd.begin(), cmd.end());
+  buf.push_back(L'\0');
+  const std::wstring cwd = Dir(exe);
+  const BOOL ok = CreateProcessW(exe.c_str(), buf.data(), nullptr, nullptr, TRUE, 0, nullptr, cwd.c_str(), &si, &pi);
+  if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
+  if (!ok) return L"Could not start the game.";
+  CloseHandle(pi.hThread);
+  CloseHandle(pi.hProcess);
+  return L"";
+}
+
+void PlayWorker() {
+  SetProgress(0, L"Preparing the game...");
+  std::wstring error = RunPrepare();
+  if (error.empty()) {
+    SetProgress(100, L"Starting DriveClub...");
+    error = StartGame();
+  }
+  g_busy = false;
+  if (error.empty()) {
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 2, 0, 0);  // close the launcher
+  } else {
+    g_status = error;
+    g_status_color = kWarn;
+    if (g_hwnd) PostMessageW(g_hwnd, WM_APP + 1, 0, 0);
+  }
+}
+
+void Play() {
+  if (g_busy || !FoldersOk()) return;
+  if (GpuBlocked()) {
+    g_status = g_gpu_problem;
+    g_status_color = kBad;
+    return;
+  }
+  SaveSettings();
+  g_busy = true;
+  g_status.clear();
+  std::thread(PlayWorker).detach();
+}
+
+// ------------------------------------------------------------------------------------------
+// folder picker
+// ------------------------------------------------------------------------------------------
+void BrowseFolder(int which) {
+  BROWSEINFOW bi{};
+  bi.hwndOwner = g_hwnd;
+  bi.lpszTitle = which == 0 ? L"Choose the DriveClub v1.28 update folder (it contains eboot.bin)"
+                            : L"Choose the DriveClub base game folder (it contains game000.dat)";
+  bi.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_USENEWUI;
+  PIDLIST_ABSOLUTE pidl = SHBrowseForFolderW(&bi);
+  if (!pidl) return;
+  wchar_t path[MAX_PATH];
+  if (SHGetPathFromIDListW(pidl, path)) {
+    g_folder[which].path = path;
+    CheckFolders();
+    if (!g_folder[which].ok) {
+      g_status = FolderProblem(which);
+      g_status_color = kBad;
+    } else {
+      g_status.clear();
+    }
+    g_changed = true;
+  }
+  CoTaskMemFree(pidl);
+}
+
+// ------------------------------------------------------------------------------------------
+// window
+// ------------------------------------------------------------------------------------------
+void CommitName() {
+  if (!g_edit) return;
+  wchar_t buf[32] = {};
+  GetWindowTextW(g_edit, buf, 31);
+  DestroyWindow(g_edit);
+  g_edit = nullptr;
+  std::wstring n;
+  for (wchar_t ch : std::wstring(buf)) if (ch >= 32 && ch < 127) n += ch;
+  if (!n.empty() && n != g_name) { g_name = n; g_changed = true; }
+  for (auto& c : g_c) if (c.patches[0] == "@name") c.items[0] = g_name;
+}
+
+void StartNameEdit(HWND parent, const Ctl& c) {
+  const RectF r = Scaled(c.ctl);
+  g_edit = CreateWindowExW(0, L"EDIT", g_name.c_str(), WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL, int(r.X + 6), int(r.Y + 6),
+                           int(r.Width - 12), int(r.Height - 12), parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+  SendMessageW(g_edit, EM_LIMITTEXT, 20, 0);
+  SendMessageW(g_edit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+  SendMessageW(g_edit, EM_SETSEL, 0, -1);
+  SetFocus(g_edit);
+}
+
+int HitControl(float x, float y, int* seg) {
+  *seg = -1;
+  for (size_t i = 0; i < g_c.size(); ++i) {
+    Ctl& c = g_c[i];
+    RectF r = Scaled(c.row);
+    if (x < r.X || x > r.X + r.Width || y < r.Y || y > r.Y + r.Height) continue;
+    if (c.kind == Kind::Segmented) {
+      RectF ct = Scaled(c.ctl);
+      if (x >= ct.X && x <= ct.X + ct.Width && y >= ct.Y && y <= ct.Y + ct.Height) {
+        *seg = std::clamp(int((x - ct.X) / (ct.Width / float(c.items.size()))), 0, int(c.items.size()) - 1);
+      }
+    }
+    return int(i);
+  }
+  return -1;
+}
+
+int HitButton(float x, float y) {
+  for (int i = 0; i < 3; ++i) {
+    RectF r = Scaled(g_btn[i]);
+    if (x >= r.X && x <= r.X + r.Width && y >= r.Y && y <= r.Y + r.Height) return i;
+  }
+  return -1;
+}
+
+int HitBrowse(float x, float y) {
+  for (int i = 0; i < 2; ++i) {
+    RectF r = Scaled(g_folder[i].browse);
+    if (x >= r.X && x <= r.X + r.Width && y >= r.Y && y <= r.Y + r.Height) return i;
+  }
+  return -1;
+}
+
+LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+  switch (m) {
+    case WM_PAINT: {
+      PAINTSTRUCT ps;
+      HDC dc = BeginPaint(h, &ps);
+      RECT rc;
+      GetClientRect(h, &rc);
+      HDC mem = CreateCompatibleDC(dc);
+      HBITMAP bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+      HGDIOBJ old = SelectObject(mem, bmp);
+      Paint(mem, rc.right, rc.bottom);
+      BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+      SelectObject(mem, old);
+      DeleteObject(bmp);
+      DeleteDC(mem);
+      EndPaint(h, &ps);
+      return 0;
+    }
+    case WM_ERASEBKGND:
+      return 1;
+    case WM_MOUSEMOVE: {
+      const float x = float(GET_X_LPARAM(l)), y = float(GET_Y_LPARAM(l));
+      int seg;
+      const int c = HitControl(x, y, &seg), b = HitButton(x, y), br = HitBrowse(x, y);
+      if (c != g_hover_ctl || seg != g_hover_seg || b != g_hover_btn || br != g_hover_browse) {
+        g_hover_ctl = c;
+        g_hover_seg = seg;
+        g_hover_btn = b;
+        g_hover_browse = br;
+        InvalidateRect(h, nullptr, FALSE);
+      }
+      TRACKMOUSEEVENT t{sizeof(t), TME_LEAVE, h, 0};
+      TrackMouseEvent(&t);
+      return 0;
+    }
+    case WM_MOUSELEAVE:
+      g_hover_ctl = g_hover_seg = g_hover_btn = g_hover_browse = -1;
+      InvalidateRect(h, nullptr, FALSE);
+      return 0;
+    case WM_LBUTTONDOWN: {
+      const float x = float(GET_X_LPARAM(l)), y = float(GET_Y_LPARAM(l));
+      if (g_busy) return 0;
+      CommitName();
+      const int br = HitBrowse(x, y);
+      if (br >= 0) {
+        BrowseFolder(br);
+        InvalidateRect(h, nullptr, FALSE);
+        return 0;
+      }
+      g_press_btn = HitButton(x, y);
+      int seg;
+      const int c = HitControl(x, y, &seg);
+      if (c >= 0) {
+        Ctl& ctl = g_c[c];
+        if (ctl.patches[0] == "@name") {
+          StartNameEdit(h, ctl);
+          return 0;
+        }
+        if (ctl.kind == Kind::Toggle) {
+          ctl.sel = !ctl.sel;
+          if (ctl.patches[0] == "@skipgpu") {
+            g_skip_gpu_check = ctl.sel != 0;
+            if (!GpuBlocked() && g_status == g_gpu_problem) g_status.clear();
+            else if (GpuBlocked()) { g_status = g_gpu_problem; g_status_color = kBad; }
+          }
+          g_changed = true;
+        } else if (seg >= 0) {
+          ctl.sel = seg;
+          if (c == g_preset) ApplyPreset(seg);
+          else if (c == g_outres || c == g_inres || c == g_wide) DerivePreset();
+          g_changed = true;
+        }
+      }
+      SetCapture(h);
+      InvalidateRect(h, nullptr, FALSE);
+      return 0;
+    }
+    case WM_LBUTTONUP: {
+      ReleaseCapture();
+      const float x = float(GET_X_LPARAM(l)), y = float(GET_Y_LPARAM(l));
+      const int b = HitButton(x, y);
+      const int pressed = g_press_btn;
+      g_press_btn = -1;
+      if (!g_busy && b >= 0 && b == pressed) {
+        if (b == 0) ResetDefaults();
+        else if (b == 1) {
+          SaveSettings();
+          g_status = L"Saved.";
+          g_status_color = kOk;
+        } else if (b == 2) Play();
+      }
+      InvalidateRect(h, nullptr, FALSE);
+      return 0;
+    }
+    case WM_COMMAND:
+      if (HIWORD(w) == EN_KILLFOCUS && g_edit) {
+        CommitName();
+        InvalidateRect(h, nullptr, FALSE);
+      }
+      return 0;
+    case WM_APP + 1:
+      InvalidateRect(h, nullptr, FALSE);
+      return 0;
+    case WM_APP + 2:
+      DestroyWindow(h);
+      return 0;
+    case WM_DESTROY:
+      PostQuitMessage(0);
+      return 0;
+  }
+  return DefWindowProcW(h, m, w, l);
+}
+
+}  // namespace
+
+int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
+  if (wcsstr(GetCommandLineW(), L"--gpu-check")) {
+    int argc = 0;
+    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    for (int i = 1; argv && i + 1 < argc; ++i) {
+      if (wcscmp(argv[i], L"--gpu-check") == 0) return GpuCheckChildMain(argv[i + 1]);
+    }
+    return 0;
+  }
+  SetProcessDPIAware();
+  CoInitialize(nullptr);
+  wchar_t selfbuf[MAX_PATH * 2];
+  GetModuleFileNameW(nullptr, selfbuf, MAX_PATH * 2);
+  g_home = Dir(selfbuf);
+  g_data = g_home + L"\\data";
+  g_runtime = g_home + L"\\runtime";
+  BuildModel();
+  MakeDirs(g_data + L"\\user");
+  LoadSettings();
+  if (!g_skip_gpu_check) g_gpu_problem = CheckGpu();
+  if (GpuBlocked()) {
+    g_status = g_gpu_problem;
+    g_status_color = kBad;
+  }
+
+  const bool play_now = wcsstr(GetCommandLineW(), L"--play") != nullptr;
+  if (play_now) {
+    if (!FoldersOk()) {
+      MessageBoxW(nullptr, L"Open DriveClub.exe once and choose the game folders.", L"DriveClub", MB_OK | MB_ICONERROR);
+      return 1;
+    }
+    if (!g_skip_gpu_check) {
+      if (const std::wstring gpu = CheckGpu(); !gpu.empty()) {
+        MessageBoxW(nullptr, gpu.c_str(), L"DriveClub", MB_OK | MB_ICONERROR);
+        return 1;
+      }
+    }
+    SaveSettings();
+    const std::wstring error = [] {
+      SetProgress(0, L"");
+      std::wstring e = RunPrepare();
+      return e.empty() ? StartGame() : e;
+    }();
+    if (!error.empty()) MessageBoxW(nullptr, error.c_str(), L"DriveClub", MB_OK | MB_ICONERROR);
+    return error.empty() ? 0 : 1;
+  }
+
+  GdiplusStartupInput gsi;
+  ULONG_PTR token = 0;
+  GdiplusStartup(&token, &gsi, nullptr);
+
+  // --snapshot FILE: render the window to a PNG and exit (checks the layout without a screen).
+  {
+    int argc = 0;
+    wchar_t** argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    for (int i = 1; argv && i + 1 < argc; ++i) {
+      if (wcscmp(argv[i], L"--snapshot") != 0) continue;
+      HDC screen = GetDC(nullptr);
+      g_scale = float(GetDeviceCaps(screen, LOGPIXELSX)) / 96.f;
+      ReleaseDC(nullptr, screen);
+      Layout();
+      const int w = int(kWinW * g_scale), h = int(TotalHeight() * g_scale);
+      {
+      Bitmap bmp(w, h, PixelFormat32bppARGB);
+      {
+        Graphics gr(&bmp);
+        HDC hdc = gr.GetHDC();
+        Paint(hdc, w, h);
+        gr.ReleaseHDC(hdc);
+      }
+      UINT count = 0, bytes = 0;
+      GetImageEncodersSize(&count, &bytes);
+      std::vector<char> raw(bytes);
+      auto* encoders = reinterpret_cast<ImageCodecInfo*>(raw.data());
+      GetImageEncoders(count, bytes, encoders);
+      for (UINT k = 0; k < count; ++k) {
+        if (wcscmp(encoders[k].MimeType, L"image/png") == 0) bmp.Save(argv[i + 1], &encoders[k].Clsid, nullptr);
+      }
+      }
+      GdiplusShutdown(token);
+      return 0;
+    }
+  }
+
+  WNDCLASSW wc{};
+  wc.lpfnWndProc = WndProc;
+  wc.hInstance = inst;
+  wc.lpszClassName = L"driveclub_launcher";
+  wc.hCursor = LoadCursorW(nullptr, MAKEINTRESOURCEW(32512));
+  wc.hIcon = LoadIconW(inst, MAKEINTRESOURCEW(1));
+  RegisterClassW(&wc);
+
+  HDC screen = GetDC(nullptr);
+  g_scale = float(GetDeviceCaps(screen, LOGPIXELSX)) / 96.f;
+  ReleaseDC(nullptr, screen);
+  Layout();
+  const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+  RECT rc{0, 0, LONG(kWinW * g_scale), LONG(TotalHeight() * g_scale)};
+  AdjustWindowRect(&rc, style, FALSE);
+  g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"DriveClub - PC", style,
+                           (GetSystemMetrics(SM_CXSCREEN) - (rc.right - rc.left)) / 2,
+                           (GetSystemMetrics(SM_CYSCREEN) - (rc.bottom - rc.top)) / 2, rc.right - rc.left,
+                           rc.bottom - rc.top, nullptr, nullptr, inst, nullptr);
+  ShowWindow(g_hwnd, show);
+  MSG msg;
+  while (GetMessageW(&msg, nullptr, 0, 0)) {
+    TranslateMessage(&msg);
+    DispatchMessageW(&msg);
+  }
+  GdiplusShutdown(token);
+  CoUninitialize();
+  return int(msg.wParam);
+}
