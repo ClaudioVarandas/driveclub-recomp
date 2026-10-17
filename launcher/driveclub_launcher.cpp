@@ -167,6 +167,10 @@ bool FileHas(const std::wstring& path, const char* text) {
   return data.find(text) != std::string::npos;
 }
 
+// DriveClub's param.sfo: the US release (CUSA00093) or the European one (CUSA00003), whose 1.28 dump
+// prepares and plays the same way.
+bool IsDriveClub(const std::wstring& sfo) { return FileHas(sfo, "CUSA00093") || FileHas(sfo, "CUSA00003"); }
+
 // The base game dump has an eboot.bin and an sce_sys\param.sfo too, so the update folder is told apart by what
 // the base game has and it does not (game000.dat) and by its version (01.28 in param.sfo).
 void CheckFolders() {
@@ -175,7 +179,7 @@ void CheckFolders() {
   const std::wstring& b0 = g_folder[1].path;
   const bool merged = !b0.empty() && Exists(b0 + L"\\game000.dat") && Exists(b0 + L"\\eboot.bin") &&
                       Exists(b0 + L"\\sce_sys\\param.sfo") &&
-                      FileHas(b0 + L"\\sce_sys\\param.sfo", "CUSA00093") &&
+                      IsDriveClub(b0 + L"\\sce_sys\\param.sfo") &&
                       FolderIsVersion128(std::filesystem::path(b0));
   if (merged && g_folder[0].path.empty()) g_folder[0].path = b0;
   const std::wstring& u = g_folder[0].path;
@@ -185,10 +189,10 @@ void CheckFolders() {
     return;
   }
   g_folder[0].ok = !u.empty() && Exists(u + L"\\eboot.bin") && Exists(u + L"\\sce_sys\\param.sfo") &&
-                   !Exists(u + L"\\game000.dat") && FileHas(u + L"\\sce_sys\\param.sfo", "CUSA00093") &&
+                   !Exists(u + L"\\game000.dat") && IsDriveClub(u + L"\\sce_sys\\param.sfo") &&
                    FolderIsVersion128(std::filesystem::path(u));
   const std::wstring& b = g_folder[1].path;
-  g_folder[1].ok = !b.empty() && Exists(b + L"\\game000.dat") && FileHas(b + L"\\sce_sys\\param.sfo", "CUSA00093");
+  g_folder[1].ok = !b.empty() && Exists(b + L"\\game000.dat") && IsDriveClub(b + L"\\sce_sys\\param.sfo");
 }
 
 // Why a chosen folder is not accepted, in words a player can act on ("" when it is fine or not chosen yet).
@@ -201,11 +205,11 @@ std::wstring FolderProblem(int which) {
   if (which == 0) {
     if (base) return L"This folder holds the base game. If your dump is already version 1.28 in this one folder, choose the same folder for both fields. Otherwise choose the v1.28 update folder here.";
     if (!eboot || !sfo) return L"Not the update: no eboot.bin and sce_sys here. If it is a parent folder, open it and choose the folder inside.";
-    if (!FileHas(p + L"\\sce_sys\\param.sfo", "CUSA00093")) return L"This is another game, not DriveClub (CUSA00093). Choose the DriveClub v1.28 update.";
+    if (!IsDriveClub(p + L"\\sce_sys\\param.sfo")) return L"This is another game, not DriveClub (CUSA00093 or CUSA00003). Choose the DriveClub v1.28 update.";
     return L"This update is not version 1.28 (its sce_sys\\param.sfo has another version). Choose the v1.28 update dump.";
   }
   if (eboot && !base) return L"This is the update, not the base game. Choose the base game folder here (it contains game000.dat).";
-  if (base && !FileHas(p + L"\\sce_sys\\param.sfo", "CUSA00093")) return L"This is another game, not DriveClub (CUSA00093). Choose the DriveClub base game folder.";
+  if (base && !IsDriveClub(p + L"\\sce_sys\\param.sfo")) return L"This is another game, not DriveClub (CUSA00093 or CUSA00003). Choose the DriveClub base game folder.";
   return L"Not the base game: no game000.dat here. If it is a parent folder, open it and choose the folder inside.";
 }
 
