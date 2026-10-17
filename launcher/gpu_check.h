@@ -10,5 +10,14 @@
 // skip_gpu_check.txt next to the launcher does the same.
 std::wstring CheckGpu();
 
+// "" when the processor has what the game's code needs (AVX, BMI1, LZCNT, MOVBE, POPCNT: Intel Haswell from 2013,
+// AMD Excavator or Ryzen, or newer), otherwise a sentence naming what is missing.
+std::wstring CheckCpu();
+
 // Entry point of the query process (DriveClub.exe --gpu-check <result file>). Exit code 0: fine, 1: refused.
 int GpuCheckChildMain(const wchar_t* result_path);
+
+// One line each for the log of the launcher: the processor with the features the game needs, and Windows with the
+// memory of the PC.
+std::wstring DescribeCpu();
+std::wstring DescribeSystem();

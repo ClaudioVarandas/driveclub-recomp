@@ -154,9 +154,16 @@ struct SelfFile {
 SelfFile ParseSelf(const Bytes& data) {
   static const uint8_t magic[4] = {'O', 0x15, '=', 0x1d};
   Span(data, 0, 4);
-  if (std::memcmp(data.data(), magic, 4) != 0) Fail("this eboot.bin is not a PS4 SELF file. Choose the folder with the version 1.28 update (its eboot.bin is the one the game ships with, not a converted or renamed file)");
-  const uint16_t count = Rd<uint16_t>(data, 24);
-  const uint64_t base = 32 + uint64_t(count) * 32;
+  // Normally a PS4 SELF; an already decrypted dump may hold the plain ELF.
+  static const uint8_t plain_magic[4] = {0x7f, 'E', 'L', 'F'};
+  const bool plain_elf = std::memcmp(data.data(), plain_magic, 4) == 0;
+  if (!plain_elf && std::memcmp(data.data(), magic, 4) != 0) {
+    char head[16];
+    std::snprintf(head, sizeof head, "%02X %02X %02X %02X", data[0], data[1], data[2], data[3]);
+    Fail(std::string("this eboot.bin is not a PS4 SELF file (it starts with ") + head + "). Choose the folder with the version 1.28 update (its eboot.bin is the one the game ships with, not a converted or renamed file)");
+  }
+  const uint16_t count = plain_elf ? 0 : Rd<uint16_t>(data, 24);
+  const uint64_t base = plain_elf ? 0 : 32 + uint64_t(count) * 32;
   Span(data, base, 64);
   static const uint8_t elfmagic[7] = {0x7f, 'E', 'L', 'F', 2, 1, 1};
   if (std::memcmp(data.data() + base, elfmagic, 7) != 0 || Rd<uint16_t>(data, base + 18) != 62) Fail("expected little-endian x86-64 ELF");
@@ -187,6 +194,14 @@ SelfFile ParseSelf(const Bytes& data) {
   if (header_end > s.elf.size()) Fail("bad ELF header size");
   std::memcpy(s.elf.data(), data.data() + base, size_t(header_end));
   std::vector<std::pair<uint64_t, uint64_t>> covered{{0, header_end}};
+  if (plain_elf) {
+    for (const auto& p : s.ph) {
+      if (!p.filesz) continue;
+      Span(data, p.offset, p.filesz);
+      std::memcpy(s.elf.data() + p.offset, data.data() + p.offset, size_t(p.filesz));
+      covered.push_back({p.offset, p.offset + p.filesz});
+    }
+  }
   for (unsigned i = 0; i < count; ++i) {
     const uint64_t flags = Rd<uint64_t>(data, 32 + i * 32), off = Rd<uint64_t>(data, 32 + i * 32 + 8),
                    size = Rd<uint64_t>(data, 32 + i * 32 + 16), mem = Rd<uint64_t>(data, 32 + i * 32 + 24);
@@ -875,6 +890,26 @@ bool SfoIsVersion128(const fs::path& param_sfo) {
   }
 }
 
+bool FolderIsVersion128(const fs::path& folder) {
+  if (SfoIsVersion128(folder / "sce_sys" / "param.sfo")) return true;
+  try {
+    const Bytes eboot = ReadFile(folder / "eboot.bin");
+    return eboot.size() == 25650713 && Fnv1a64(eboot) == "c706870aa4881011";
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+std::string SfoField(const fs::path& param_sfo, const char* key) {
+  try {
+    const auto fields = ParseSfo(ReadFile(param_sfo), nullptr);
+    const auto it = fields.find(key);
+    return it == fields.end() ? std::string() : it->second;
+  } catch (const std::exception&) {
+    return "";
+  }
+}
+
 std::string PrepareGame(const fs::path& update, const fs::path& base, const fs::path& work, const fs::path& patch_xml,
                         bool patches_only, const std::function<void(int, const std::string&)>& progress) {
   try {
@@ -923,7 +958,7 @@ std::string PrepareGame(const fs::path& update, const fs::path& base, const fs::
     std::map<std::string, uint32_t> ints;
     const auto sfo = ParseSfo(ReadFile(update / "sce_sys" / "param.sfo"), &ints);
     if (sfo.count("TITLE_ID") == 0 || sfo.at("TITLE_ID") != "CUSA00093") return "The update folder is not DriveClub (CUSA00093).";
-    if (!Version128(sfo)) {
+    if (!FolderIsVersion128(update)) {
       const auto field = [&](const char* key) { return sfo.count(key) ? sfo.at(key) : std::string("none"); };
       return "The update folder must be DriveClub version 1.28 (its param.sfo says APP_VER " + field("APP_VER") + ", VERSION " + field("VERSION") + ").";
     }

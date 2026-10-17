@@ -6,6 +6,7 @@
 #include <vulkan/vulkan.h>
 
 #include <windows.h>
+#include <cpuid.h>
 
 #include <algorithm>
 #include <cstdio>
@@ -262,4 +263,84 @@ std::wstring CheckGpu() {
     }
   }
   return L"";
+}
+
+std::wstring CheckCpu() {
+  unsigned a = 0, b = 0, c = 0, d = 0;
+  if (!__get_cpuid(1, &a, &b, &c, &d)) return L"";
+  std::wstring missing;
+  const auto need = [&](bool have, const wchar_t* name) {
+    if (have) return;
+    if (!missing.empty()) missing += L", ";
+    missing += name;
+  };
+  bool avx = (c & (1u << 28)) != 0 && (c & (1u << 27)) != 0;
+  if (avx) {
+    unsigned lo = 0, hi = 0;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    avx = (lo & 6) == 6;
+  }
+  need(avx, L"AVX");
+  need((c & (1u << 23)) != 0, L"POPCNT");
+  need((c & (1u << 22)) != 0, L"MOVBE");
+  unsigned b7 = 0, d7 = 0, c7 = 0, a7 = 0;
+  need(__get_cpuid_count(7, 0, &a7, &b7, &c7, &d7) && (b7 & (1u << 3)) != 0, L"BMI1");
+  unsigned ae = 0, be = 0, ce = 0, de = 0;
+  need(__get_cpuid(0x80000001u, &ae, &be, &ce, &de) && (ce & (1u << 5)) != 0, L"LZCNT");
+  if (missing.empty()) return L"";
+  return L"Your processor does not support " + missing +
+         L", which the game needs. Intel Haswell (2013) or newer, or AMD Excavator or Ryzen or newer, is required. If you are sure your processor has these, turn on \"Skip the hardware check\".";
+}
+
+std::wstring DescribeCpu() {
+  unsigned a = 0, b = 0, c = 0, d = 0;
+  char brand[64] = {0};
+  for (unsigned i = 0; i < 3; ++i) {
+    if (!__get_cpuid(0x80000002u + i, &a, &b, &c, &d)) return L"unknown processor";
+    memcpy(brand + i * 16 + 0, &a, 4);
+    memcpy(brand + i * 16 + 4, &b, 4);
+    memcpy(brand + i * 16 + 8, &c, 4);
+    memcpy(brand + i * 16 + 12, &d, 4);
+  }
+  const char* name = brand;
+  while (*name == ' ') ++name;
+  unsigned c1 = 0;
+  __get_cpuid(1, &a, &b, &c1, &d);
+  unsigned b7 = 0, c7 = 0, d7 = 0, a7 = 0;
+  __get_cpuid_count(7, 0, &a7, &b7, &c7, &d7);
+  unsigned c81 = 0;
+  __get_cpuid(0x80000001u, &a, &b, &c81, &d);
+  char features[160];
+  snprintf(features, sizeof features, "; avx %d avx2 %d bmi1 %d movbe %d lzcnt %d sse4a %d", int((c1 >> 28) & 1), int((b7 >> 5) & 1),
+           int((b7 >> 3) & 1), int((c1 >> 22) & 1), int((c81 >> 5) & 1), int((c81 >> 6) & 1));
+  std::string text(name);
+  while (!text.empty() && text.back() == ' ') text.pop_back();
+  return Widen((text + features).c_str());
+}
+
+std::wstring DescribeSystem() {
+  unsigned long major = 0, minor = 0, build = 0;
+  typedef LONG(WINAPI * RtlGetVersionFn)(OSVERSIONINFOW*);
+  HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+  RtlGetVersionFn get_version = ntdll ? reinterpret_cast<RtlGetVersionFn>(GetProcAddress(ntdll, "RtlGetVersion")) : nullptr;
+  if (get_version) {
+    OSVERSIONINFOW info{};
+    info.dwOSVersionInfoSize = sizeof info;
+    if (get_version(&info) == 0) {
+      major = info.dwMajorVersion;
+      minor = info.dwMinorVersion;
+      build = info.dwBuildNumber;
+    }
+  }
+  MEMORYSTATUSEX memory{};
+  memory.dwLength = sizeof memory;
+  unsigned long long total = 0, avail = 0;
+  if (GlobalMemoryStatusEx(&memory)) {
+    total = memory.ullTotalPhys >> 20;
+    avail = memory.ullAvailPhys >> 20;
+  }
+  wchar_t text[200];
+  swprintf(text, 200, L"Windows %lu.%lu build %lu, %llu MB memory (%llu MB free)%ls", major, minor, build, total, avail,
+           ntdll && GetProcAddress(ntdll, "wine_get_version") ? L", running under Wine/Proton" : L"");
+  return text;
 }

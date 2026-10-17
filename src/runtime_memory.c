@@ -91,6 +91,14 @@ typedef struct { int kind; uintptr_t address; uint64_t size; } PendingHook;
 static PendingHook pending[64]; static size_t pending_count;
 static size_t allocations, maps, flexible_maps, protects, queries;
 static uint64_t live_bytes, flexible_bytes;
+/* A refused memory request is logged (the first dozen), so a crash that follows it can be explained. */
+static int32_t mem_fail(int32_t code, int line) {
+    static volatile long reported[2048]; /* three per place: the game probes some requests on purpose */
+    if (line >= 0 && line < 2048 && __sync_fetch_and_add(&reported[line], 1) < 3)
+        printf("Runtime: memory request refused (code 0x%x, runtime_memory.c line %d; direct %llu MB in use, flexible %llu MB)\n",
+               (unsigned)code, line, (unsigned long long)(live_bytes >> 20), (unsigned long long)(flexible_bytes >> 20));
+    return code;
+}
 
 static int valid_alignment(uint64_t a) { return a >= PAGE && a <= POOL_SIZE && !(a & (a-1)); }
 static uint64_t align_up(uint64_t n, uint64_t a) { return (n+a-1) & ~(a-1); }
@@ -372,15 +380,15 @@ static int32_t place(void **inout, uint64_t size, int prot, int flags, uint64_t 
     uintptr_t address=(uintptr_t)*inout;
     if (flags & MAP_FIXED_FLAG) {
         if (!address || address%PAGE) return INVALID;
-        if ((flags & MAP_NO_OVERWRITE) && overlaps(address,address+size,1)) return NO_MEMORY;
+        if ((flags & MAP_NO_OVERWRITE) && overlaps(address,address+size,1)) return mem_fail(NO_MEMORY, __LINE__);
     } else {
         address=find_free(address,size,alignment);
-        if (!address) return NO_MEMORY;
+        if (!address) return mem_fail(NO_MEMORY, __LINE__);
     }
-    if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return NO_MEMORY;
+    if (host_map(address,size,host_prot(prot),kind==KIND_RESERVED,phys)) return mem_fail(NO_MEMORY, __LINE__);
     void *mapped=(void *)address;
     drop_range(address,address+size);
-    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return NO_MEMORY;
+    if (vma_insert(vma_index(address),(Vma){address,address+size,kind,prot,type,phys})) return mem_fail(NO_MEMORY, __LINE__);
     if (kind==KIND_FLEXIBLE) flexible_bytes+=size;
     if (kind!=KIND_RESERVED) queue_hook(HOOK_MAP,address,size);
     *inout=mapped;
@@ -409,14 +417,14 @@ static ABI int32_t direct_allocate(int64_t low, int64_t high, uint64_t size,
     if (!out || low < 0 || high < 0 || !size || size % PAGE || !valid_alignment(alignment) || type < 0 || type > 10)
         return INVALID;
     uint64_t end = (uint64_t)high < POOL_SIZE ? (uint64_t)high : POOL_SIZE;
-    if ((uint64_t)low >= end || size > end - (uint64_t)low) return NO_SPACE;
+    if ((uint64_t)low >= end || size > end - (uint64_t)low) return mem_fail(NO_SPACE, __LINE__);
     write_lock();
-    if (pool()) { write_unlock(); return NO_MEMORY; }
+    if (pool()) { write_unlock(); return mem_fail(NO_MEMORY, __LINE__); }
     uint64_t start = align_up((uint64_t)low, alignment);
     int slot = -1;
     for (int i=0; i<LIMIT; ++i) if (!blocks[i].used) { slot=i; break; }
     for (;;) {
-        if (slot<0 || start > end || size > end-start) { write_unlock(); return NO_SPACE; }
+        if (slot<0 || start > end || size > end-start) { write_unlock(); return mem_fail(NO_SPACE, __LINE__); }
         int overlap = 0;
         for (int i=0; i<LIMIT; ++i) {
             Block b = blocks[i];
@@ -513,9 +521,9 @@ static ABI int32_t direct_release(uint64_t start, uint64_t size) {
 }
 static int32_t map_flexible_locked(void **inout, uint64_t size, int prot, int flags) {
     if (!inout || !size || size%PAGE || (prot & ~0x37)) return INVALID;
-    if (flexible_bytes+size>FLEXIBLE_SIZE || pool()) return NO_MEMORY;
+    if (flexible_bytes+size>FLEXIBLE_SIZE || pool()) return mem_fail(NO_MEMORY, __LINE__);
     uint64_t phys=flex_alloc(size);
-    if (phys==UINT64_MAX) return NO_MEMORY;
+    if (phys==UINT64_MAX) return mem_fail(NO_MEMORY, __LINE__);
     int32_t result=place(inout,size,prot,flags,PAGE,KIND_FLEXIBLE,0,phys);
     if (result) flex_free(phys,size); else ++flexible_maps;
     return result;
@@ -547,7 +555,7 @@ static ABI int32_t reserve_range(void **inout, uint64_t size, int flags, uint64_
     if (!inout || !size || size%PAGE || !valid_alignment(alignment)) return INVALID;
     write_lock();
     if ((flags & MAP_FIXED_FLAG) && overlaps((uintptr_t)*inout,(uintptr_t)*inout+size,0)) {
-        write_unlock(); return NO_MEMORY;
+        write_unlock(); return mem_fail(NO_MEMORY, __LINE__);
     }
     int32_t result=place(inout,size,0,flags,alignment,KIND_RESERVED,0,0);
     write_unlock();
@@ -560,7 +568,7 @@ static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type
     if ((prot & ~0x37) || !covered(start,end,0)) return INVALID;
     if (host_protect(start,end-start,host_prot(prot))) return INVALID;
     int error; size_t i=carve(start,end,&error);
-    if (error) return NO_MEMORY;
+    if (error) return mem_fail(NO_MEMORY, __LINE__);
     for (; i<vma_count && vmas[i].start<end; ++i) { vmas[i].prot=prot; if (type>=0) vmas[i].type=type; }
     queue_hook(HOOK_INVALIDATE,start,end-start);
     ++protects;

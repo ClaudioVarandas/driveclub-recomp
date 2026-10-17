@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#endif
 #include "bbport_frame_info.h"
 #include "common/debug.h"
 #include "common/elf_info.h"
@@ -894,10 +898,18 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     // A line every 30 s for support: how the game was running when something went wrong.
     if (is_game_frame && !is_reusing_frame) {
         static auto status_window = std::chrono::steady_clock::now();
-        static u32 status_games = 0, status_images = 0;
+        static u32 status_games = 0, status_images = 0, status_hitches = 0;
+        static double status_worst_ms = 0.0;
+        static auto status_prev = status_window;
         ++status_games;
         status_images += 1 + shown;
         const auto status_now = std::chrono::steady_clock::now();
+        {
+            const double frame_ms = std::chrono::duration<double, std::milli>(status_now - status_prev).count();
+            status_prev = status_now;
+            status_worst_ms = std::max(status_worst_ms, frame_ms);
+            status_hitches += frame_ms > 50.0 ? 1 : 0;
+        }
         const double status_s = std::chrono::duration<double>(status_now - status_window).count();
         if (status_s >= 30.0) {
             const auto& cfg = BbSettings::Get();
@@ -907,9 +919,21 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
                         : cfg.frame_gen_paused              ? "paused"
                                                             : BbSettings::FrameGenName(cfg.frame_gen),
                         BbSettings::AaName(cfg.aa_mode));
+            std::printf("; worst frame %.0f ms, %u over 50 ms", status_worst_ms, status_hitches);
+#ifdef _WIN32
+            {
+                PROCESS_MEMORY_COUNTERS counters{};
+                if (K32GetProcessMemoryInfo(GetCurrentProcess(), &counters, sizeof(counters))) {
+                    std::printf("; process memory %zu MB (peak %zu MB, commit %zu MB)",
+                                size_t(counters.WorkingSetSize >> 20), size_t(counters.PeakWorkingSetSize >> 20),
+                                size_t(counters.PagefileUsage >> 20));
+                }
+            }
+#endif
             std::puts("");
             status_window = status_now;
-            status_games = status_images = 0;
+            status_games = status_images = status_hitches = 0;
+            status_worst_ms = 0.0;
         }
     }
     free_frame();

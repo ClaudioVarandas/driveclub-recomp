@@ -75,6 +75,13 @@ void Swapchain::Create(u32 width_, u32 height_) {
     ASSERT_MSG(swapchain_result == vk::Result::eSuccess, "Failed to create swapchain: {}",
                vk::to_string(swapchain_result));
     swapchain = chain;
+    {
+        static int reported = 0;
+        if (reported++ < 4) {
+            std::printf("Swapchain: %ux%u, %s, present mode %s, %u images\n", extent.width, extent.height,
+                        vk::to_string(format.format).c_str(), vk::to_string(present_mode).c_str(), image_count);
+        }
+    }
 
     SetupImages();
     RefreshSemaphores();

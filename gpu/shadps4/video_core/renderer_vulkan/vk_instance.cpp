@@ -161,6 +161,16 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
             return left_mem_size > right_mem_size;
         });
         physical_device = physical_devices[std::get<0>(properties2[0])];
+        // Every card the driver offers, the chosen one first: a laptop may have a second, slower one.
+        if (properties2.size() > 1) {
+            std::string others;
+            for (size_t i = 1; i < properties2.size(); ++i) {
+                const auto& other = std::get<1>(properties2[i]).properties;
+                others += std::string(others.empty() ? "" : ", ") + other.deviceName.data() + " (" +
+                          vk::to_string(other.deviceType) + ")";
+            }
+            std::printf("GPU: other graphics devices: %s\n", others.c_str());
+        }
     } else {
         ASSERT_MSG(physical_device_index < num_physical_devices,
                    "Invalid physical device index {} provided when only {} devices exist",
@@ -173,6 +183,12 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
     format_properties = GetFormatProperties(physical_device);
     properties = physical_device.getProperties();
     memory_properties = physical_device.getMemoryProperties();
+    {
+        const auto chain = physical_device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceDriverProperties>();
+        const auto& driver_properties = chain.get<vk::PhysicalDeviceDriverProperties>();
+        std::printf("GPU: %s driver '%s' %s, %s\n", properties.deviceName.data(), driver_properties.driverName.data(),
+                    driver_properties.driverInfo.data(), vk::to_string(properties.deviceType).c_str());
+    }
     {
         // For support: which card, which driver (NVIDIA packs its driver version differently).
         const u32 driver = properties.driverVersion;

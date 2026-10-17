@@ -21,6 +21,11 @@ namespace Vulkan {
 
 class FrameCapture {
 public:
+    /// Flips seen so far.
+    static u64 Flips() {
+        return flips.load(std::memory_order_relaxed);
+    }
+
     /// VideoOut thread, per flip: frame boundary, presented buffer, trigger file check.
     static void OnFlip(VAddr presented_address);
 

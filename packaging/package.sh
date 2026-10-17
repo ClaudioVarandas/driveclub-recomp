@@ -21,6 +21,8 @@ cp out/DriveClubGame.exe "$OUT/runtime/"
 strip --strip-all "$OUT/runtime/DriveClubGame.exe" || true
 cp patches/DriveClub.xml "$OUT/runtime/patches/"
 cp packaging/release/README.txt packaging/release/THIRD_PARTY_NOTICES.txt LICENSE "$OUT/"
+echo "$VERSION" > "$OUT/version.txt"
+
 # Every non-system DLL the game program loads, so nothing has to be installed.
 ldd out/DriveClubGame.exe | awk '{print $3}' | grep -i '/msys64/' | sort -u | while read -r dll; do
   cp "$dll" "$OUT/runtime/"
@@ -33,6 +35,8 @@ cp packaging/dlss/NVIDIA-DLSS-LICENSE.txt packaging/dlss/dlss_bridge-LICENSE.txt
 for extra in SDL3.dll; do
   [ -f "out/$extra" ] && cp "out/$extra" "$OUT/runtime/" || true
 done
+# The program files of the release, so the launcher can tell when some are missing.
+(cd "$OUT/runtime" && find . -type f ! -name files.txt | sed 's|^\./||' | sort > files.txt)
 echo "files: $(find "$OUT" -type f | wc -l), size: $(du -sh "$OUT" | cut -f1)"
 python - "$OUT" "release/$NAME.zip" <<'PYEOF'
 import os, sys, zipfile

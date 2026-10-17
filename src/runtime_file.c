@@ -102,6 +102,15 @@ static void log_missing(const char *guest) {
     if (!known && count<512) seen[count++]=h;
     __sync_lock_release(&busy);
     if (!known) printf("Runtime: open(%s) -> not found\n",guest);
+    /* gameNNN.dat are the archive volumes: a missing one means an incomplete dump and a crash soon after. */
+    if (!known && !strncmp(guest,"/app0/game",10) && guest[10]>='0' && guest[10]<='9' && strstr(guest,".dat"))
+        printf("Runtime: WARNING archive volume %s is missing from the game folders (incomplete dump?)\n",guest+6);
+}
+/* A file operation that failed for a reason other than "not found" (a locked file, no permission, a full disk). */
+static void log_io_error(const char *what, const char *guest, int err) {
+    static volatile long reported;
+    if (__sync_fetch_and_add(&reported, 1) < 12)
+        printf("Runtime: %s%s%s failed: %s (errno %d)\n", what, guest ? " " : "", guest ? guest : "", strerror(err), err);
 }
 static char app0_base[600];
 void runtime_file_set_base(const char *dir) { snprintf(app0_base,sizeof(app0_base),"%s",dir ? dir : ""); }
@@ -260,6 +269,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
         if (host<0) {
             e=errno;
             if (e==ENOENT) { ++missing; log_missing(guest); }
+            else log_io_error("open",guest,e);
             return -e;
         }
         if (host_fstat(host,&s)) memset(&s,0,sizeof(s));
@@ -359,7 +369,7 @@ static int64_t do_write(int fd,const void *buffer,uint64_t size) {
     int h=host_fd(fd);
     if (h<0) return -EBADF;
     ssize_t n=host_write(h,buffer,size);
-    if (n<0) return -errno;
+    if (n<0) { const int e=errno; log_io_error("write",NULL,e); return -e; }
     __atomic_add_fetch(&writes,1,__ATOMIC_RELAXED);
     return n;
 }

@@ -404,6 +404,20 @@ vk::UniqueInstance CreateInstance(Frontend::WindowSystemType window_type, bool e
         },
     };
 
+    {
+        // Layers that the loader would put into every Vulkan program (overlays, capture tools) are a known
+        // source of crashes: the list goes into the log.
+        const auto available = vk::enumerateInstanceLayerProperties();
+        if (available.result == vk::Result::eSuccess && !available.value.empty()) {
+            std::string names;
+            for (const auto& layer : available.value) {
+                names += ' ';
+                names += layer.layerName.data();
+            }
+            std::printf("Vulkan layers installed:%s\n", names.c_str());
+        }
+    }
+
     vk::StructureChain<vk::InstanceCreateInfo, vk::LayerSettingsCreateInfoEXT> instance_ci_chain = {
         vk::InstanceCreateInfo{
             .pApplicationInfo = &application_info,

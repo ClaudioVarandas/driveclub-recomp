@@ -28,6 +28,7 @@
 #include <thread>
 #include <vector>
 
+#include "datx.h"
 #include "gpu_check.h"
 #include "prepare.h"
 #include "unlock.h"
@@ -175,7 +176,7 @@ void CheckFolders() {
   const bool merged = !b0.empty() && Exists(b0 + L"\\game000.dat") && Exists(b0 + L"\\eboot.bin") &&
                       Exists(b0 + L"\\sce_sys\\param.sfo") &&
                       FileHas(b0 + L"\\sce_sys\\param.sfo", "CUSA00093") &&
-                      SfoIsVersion128(std::filesystem::path(b0 + L"\\sce_sys\\param.sfo"));
+                      FolderIsVersion128(std::filesystem::path(b0));
   if (merged && g_folder[0].path.empty()) g_folder[0].path = b0;
   const std::wstring& u = g_folder[0].path;
   if (merged && u == b0) {
@@ -185,7 +186,7 @@ void CheckFolders() {
   }
   g_folder[0].ok = !u.empty() && Exists(u + L"\\eboot.bin") && Exists(u + L"\\sce_sys\\param.sfo") &&
                    !Exists(u + L"\\game000.dat") && FileHas(u + L"\\sce_sys\\param.sfo", "CUSA00093") &&
-                   SfoIsVersion128(std::filesystem::path(u + L"\\sce_sys\\param.sfo"));
+                   FolderIsVersion128(std::filesystem::path(u));
   const std::wstring& b = g_folder[1].path;
   g_folder[1].ok = !b.empty() && Exists(b + L"\\game000.dat") && FileHas(b + L"\\sce_sys\\param.sfo", "CUSA00093");
 }
@@ -265,10 +266,11 @@ void BuildModel() {
                         00));
   const int wide = (g_wide = int(g_c.size()), seg(L"Widescreen (render and output)",
                        L"Ultrawide sizes. These change both the render and the output size. The needed memory patch is added for you.",
-                       {L"Off", L"21:9 2560x1080", L"32:9 3840x1080", L"21:9 3440x1440"},
+                       {L"Off", L"21:9 2560x1080", L"32:9 3840x1080", L"21:9 3440x1440", L"32:9 5120x1440"},
                        {"", "1080p 21:9 [2560x1080] Internal + Output resolution [DEPTH BUG]",
                         "1080p 32:9 [3840x1080] Internal + Output resolution [DEPTH BUG]",
-                        "1440p 21:9 [3440x1440] Internal + Output resolution [DEPTH BUG]"},
+                        "1440p 21:9 [3440x1440] Internal + Output resolution [DEPTH BUG]",
+                        "1440p 32:9 [5120x1440] Internal + Output resolution [DEPTH BUG]"},
                        00));
   const int fov = toggle(L"Widescreen field-of-view fix", L"For wide and ultrawide resolutions only.",
                          "FOV fix for wide resolutions", false);
@@ -298,14 +300,14 @@ void BuildModel() {
                L"Adds a made-up frame between each two real ones (FSR 3.1 works on any graphics card; DLSS needs a GeForce RTX 40 series for 2x, RTX 50 series for 3x and 4x), so the picture looks two to four times as smooth. It adds a little delay and can smear fast motion. Best when the game already runs at 45 FPS or more; turn on the Unlocked frame rate as well.",
                {L"Off", L"FSR 3.1 (2x)", L"DLSS (2x)", L"DLSS (3x)", L"DLSS (4x)"}, {"@fgen", "", "", "", ""}, 0);
   g_fgen = -1;  // frame generation is not offered in this release
-  const int skipgpu = toggle(L"Skip the graphics card check",
-                             L"The launcher checks that your graphics card can run the game (Vulkan 1.3). If it refuses a card that does work, turn this on to start anyway.",
+  const int skipgpu = toggle(L"Skip the hardware check",
+                             L"The launcher checks that your processor and graphics card can run the game (Vulkan 1.3). If it refuses hardware that does work, turn this on to start anyway.",
                              "@skipgpu", false);
   const int showfps = toggle(L"Show FPS counter", L"Draws the frame rate in the top right corner while playing.", "@fps", false);
   const int full = toggle(L"Fullscreen", L"Plays borderless fullscreen. Turn off for a window.", "@full", true);
   const int unlock = toggle(L"Unlock DLC content",
                             L"Unlocks the DLC content: add-on cars, bikes, tours and livery decals. Cars you earn by playing still unlock through normal progression. Built from your own game files; the game folders are not modified.",
-                            "@unlock", true);
+                            "@unlock", false);
   // The cards flow into as many columns as the window width allows (see LayoutPass).
   g_cards.push_back({L"FRAME RATE AND RESOLUTION", {g_preset, fps, outres, inres, wide, fov}, 0});
   g_cards.push_back({L"ANTI-ALIASING", {g_aa}, 0});
@@ -314,7 +316,7 @@ void BuildModel() {
                      L"Community patches for DriveClub version 1.28."});
 }
 
-bool fps_counter = false, fast_render = false, full_screen = true, unlock_dlc = true;  // the settings that are not patches
+bool fps_counter = false, fast_render = false, full_screen = true, unlock_dlc = false;  // the settings that are not patches
 
 // Output / render choices per preset: indices into the "Output resolution" and "Render resolution" rows,
 // and the "Mirror and reflection updates" choice (slower presets update the mirrors less often).
@@ -347,7 +349,7 @@ void LoadSettings() {
     if (line.rfind("unlocked=", 0) == 0) unlocked_saved = line.substr(9) == "1";
     if (line.rfind("skip_gpu_check=", 0) == 0) g_skip_gpu_check = line.substr(15) == "1";
     if (line.rfind("full=", 0) == 0) full_screen = line.substr(5) == "1";
-    if (line.rfind("unlock=", 0) == 0) unlock_dlc = line.substr(7) == "1";
+    if (line.rfind("dlc_unlock=", 0) == 0) unlock_dlc = line.substr(11) == "1";  // the "unlock=" of earlier versions is not read: off for everyone
   }
   for (auto& c : g_c) if (c.patches[0] == "@name") c.items[0] = g_name;
   CheckFolders();
@@ -445,7 +447,7 @@ void SaveSettings() {
   MakeDirs(g_data + L"\\user");
   {
     std::ofstream ini(IniPath().c_str(), std::ios::binary | std::ios::trunc);
-    bool fps_on = false, fast_on = false, full_on = true, unlock_on = true;
+    bool fps_on = false, fast_on = false, full_on = true, unlock_on = false;
     for (const auto& c : g_c) {
       if (c.kind == Kind::Toggle && c.patches[0] == "@fps") fps_on = c.sel != 0;
       if (c.kind == Kind::Toggle && c.patches[0] == "@fast") fast_on = c.sel != 0;
@@ -453,7 +455,7 @@ void SaveSettings() {
       if (c.kind == Kind::Toggle && c.patches[0] == "@unlock") unlock_on = c.sel != 0;
     }
     ini << "update=" << Narrow(g_folder[0].path) << "\r\nbase=" << Narrow(g_folder[1].path) << "\r\nfps=" << (fps_on ? 1 : 0)
-        << "\r\nfast=" << (fast_on ? 1 : 0) << "\r\nunlocked=" << ((g_fps >= 0 && g_c[g_fps].sel == 3) ? 1 : 0) << "\r\nskip_gpu_check=" << (g_skip_gpu_check ? 1 : 0) << "\r\nmirror=" << (g_mirror >= 0 ? g_c[g_mirror].sel : 0) << "\r\nlanguage=" << g_lang_id << "\r\nup=" << (g_up >= 0 ? g_c[g_up].sel : 0) << "\r\naa=" << (g_aa >= 0 ? g_c[g_aa].sel : 0) << "\r\nfgen=" << (g_fgen >= 0 ? g_c[g_fgen].sel : 0) <<"\r\nname=" << Narrow(g_name) <<"\r\nfull=" << (full_on ? 1 : 0) << "\r\nunlock=" << (unlock_on ? 1 : 0) << "\r\n";
+        << "\r\nfast=" << (fast_on ? 1 : 0) << "\r\nunlocked=" << ((g_fps >= 0 && g_c[g_fps].sel == 3) ? 1 : 0) << "\r\nskip_gpu_check=" << (g_skip_gpu_check ? 1 : 0) << "\r\nmirror=" << (g_mirror >= 0 ? g_c[g_mirror].sel : 0) << "\r\nlanguage=" << g_lang_id << "\r\nup=" << (g_up >= 0 ? g_c[g_up].sel : 0) << "\r\naa=" << (g_aa >= 0 ? g_c[g_aa].sel : 0) << "\r\nfgen=" << (g_fgen >= 0 ? g_c[g_fgen].sel : 0) <<"\r\nname=" << Narrow(g_name) <<"\r\nfull=" << (full_on ? 1 : 0) << "\r\ndlc_unlock=" << (unlock_on ? 1 : 0) << "\r\n";
     // The renderer optimizations that are switched off, as a bit mask. The draw thread is bit 37.
     const std::wstring toggles = g_data + L"\\user\\toggles.txt";
     std::ofstream tog(toggles.c_str(), std::ios::binary | std::ios::trunc);
@@ -663,7 +665,7 @@ void Paint(HDC hdc, int w, int h) {
   Text(g, L"PC  -  game folders and patches", fSub, Scaled(RectF(kMargin + 22, 50, 520, 22)), kMuted);
   {
     const bool folder_problem = !FolderProblem(0).empty() || !FolderProblem(1).empty();
-    const wchar_t* chip = GpuBlocked() ? L"Graphics card not supported"
+    const wchar_t* chip = GpuBlocked() ? (g_gpu_problem.rfind(L"Your processor", 0) == 0 ? L"Processor not supported" : L"Graphics card not supported")
                           : FoldersOk() ? L"Game found" : folder_problem ? L"Check the game folders" : L"Choose the game folders";
     StringFormat measure(StringFormat::GenericTypographic());
     measure.SetFormatFlags(StringFormatFlagsNoWrap | StringFormatFlagsMeasureTrailingSpaces);
@@ -852,6 +854,176 @@ std::wstring Timestamp() {
   return b;
 }
 
+// ------------------------------------------------------------------------------------------
+// launcher log and checks before the game starts
+// ------------------------------------------------------------------------------------------
+// logs\launcher.log keeps what the launcher saw (the log of the game only exists once the game has started, so a
+// failure while preparing would leave nothing to attach to a report). The checks refuse only what cannot work.
+std::wstring Leaf(const std::wstring& path) {
+  std::wstring p = path;
+  while (!p.empty() && (p.back() == L'\\' || p.back() == L'/')) p.pop_back();
+  const size_t slash = p.find_last_of(L"\\/");
+  return slash == std::wstring::npos ? p : p.substr(slash + 1);
+}
+
+void LauncherLog(const std::string& text) {
+  if (g_home.empty()) return;
+  MakeDirs(g_home + L"\\logs");
+  FILE* f = _wfopen((g_home + L"\\logs\\launcher.log").c_str(), L"ab");
+  if (!f) return;
+  SYSTEMTIME t;
+  GetLocalTime(&t);
+  std::fprintf(f, "%04d-%02d-%02d %02d:%02d:%02d  %s\r\n", t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond, text.c_str());
+  std::fclose(f);
+}
+
+// Keeps the newest logs and crash dumps; older ones are deleted so the folder does not grow without end.
+void PruneLogs(const wchar_t* pattern, size_t keep) {
+  std::vector<std::pair<unsigned long long, std::wstring>> found;
+  WIN32_FIND_DATAW data;
+  const std::wstring dir = g_home + L"\\logs\\";
+  HANDLE h = FindFirstFileW((dir + pattern).c_str(), &data);
+  if (h == INVALID_HANDLE_VALUE) return;
+  do {
+    found.push_back({(static_cast<unsigned long long>(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime,
+                     dir + data.cFileName});
+  } while (FindNextFileW(h, &data));
+  FindClose(h);
+  std::sort(found.begin(), found.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+  for (size_t i = keep; i < found.size(); ++i) DeleteFileW(found[i].second.c_str());
+}
+
+void StartLauncherLog() {
+  PruneLogs(L"driveclub_*.log", 25);
+  PruneLogs(L"crash_*.dmp", 5);
+  // One file for all starts; it starts over once it is big.
+  WIN32_FILE_ATTRIBUTE_DATA info;
+  const std::wstring path = g_home + L"\\logs\\launcher.log";
+  if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &info) && info.nFileSizeLow > 256 * 1024) DeleteFileW(path.c_str());
+  std::string version = "unknown";
+  {
+    std::ifstream in((g_home + L"\\version.txt").c_str());
+    std::string line;
+    if (std::getline(in, line)) {
+      while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+      if (!line.empty()) version = line;
+    }
+  }
+  LauncherLog("launcher started, release " + version + ", in folder " + Narrow(Leaf(g_home)));
+  LauncherLog("system: " + Narrow(DescribeSystem()));
+  LauncherLog("processor: " + Narrow(DescribeCpu()));
+  const std::wstring home_lower = g_home;
+  if (home_lower.find(L"\\Temp\\") != std::wstring::npos || home_lower.find(L"\\Rar$") != std::wstring::npos)
+    LauncherLog("warning: the launcher runs from a temporary folder (unzip the download first)");
+  if (home_lower.find(L"Program Files") != std::wstring::npos)
+    LauncherLog("warning: the folder is under Program Files (settings and logs cannot be written there)");
+  if (home_lower.find(L"OneDrive") != std::wstring::npos)
+    LauncherLog("warning: the folder is synced by OneDrive (files can be locked while they sync)");
+  for (wchar_t ch : g_home) {
+    if (ch > 127) {
+      LauncherLog("note: the folder path has non-ASCII characters");
+      break;
+    }
+  }
+}
+
+// What a game folder looks like, for the log: the facts that decide whether the dump is the right one.
+std::string FolderFacts(const char* label, const std::wstring& path) {
+  std::string s = std::string(label) + ": " + (path.empty() ? "not chosen" : Narrow(Leaf(path)));
+  if (path.empty() || !Exists(path)) return s + (path.empty() ? "" : " (folder missing)");
+  WIN32_FILE_ATTRIBUTE_DATA info;
+  if (GetFileAttributesExW((path + L"\\eboot.bin").c_str(), GetFileExInfoStandard, &info)) {
+    unsigned char head[4] = {0, 0, 0, 0};
+    FILE* f = _wfopen((path + L"\\eboot.bin").c_str(), L"rb");
+    if (f) {
+      if (std::fread(head, 1, 4, f) != 4) std::memset(head, 0, 4);
+      std::fclose(f);
+    }
+    char text[80];
+    std::snprintf(text, sizeof text, "; eboot.bin %llu bytes, starts %02X %02X %02X %02X",
+                  (unsigned long long)info.nFileSizeLow + ((unsigned long long)info.nFileSizeHigh << 32), head[0], head[1], head[2], head[3]);
+    s += text;
+  } else {
+    s += "; no eboot.bin";
+  }
+  const std::wstring sfo = path + L"\\sce_sys\\param.sfo";
+  if (Exists(sfo)) {
+    s += "; TITLE_ID " + SfoField(std::filesystem::path(sfo), "TITLE_ID") + ", APP_VER " + SfoField(std::filesystem::path(sfo), "APP_VER") +
+         ", VERSION " + SfoField(std::filesystem::path(sfo), "VERSION");
+  } else {
+    s += "; no param.sfo";
+  }
+  s += Exists(path + L"\\game000.dat") ? "; game000.dat present" : "; no game000.dat";
+  s += Exists(path + L"\\game.ndx") ? ", game.ndx present" : ", no game.ndx";
+  return s;
+}
+
+// "" when the game can start. Otherwise a sentence for the player.
+std::string g_preflight_note;  // something the player should know about, but not a reason to refuse
+
+std::wstring Preflight() {
+  g_preflight_note.clear();
+  LauncherLog(FolderFacts("update folder", g_folder[0].path));
+  LauncherLog(FolderFacts("base folder", g_folder[1].path));
+  // The program files the release came with (antivirus programs sometimes remove some of them).
+  {
+    std::ifstream in((g_runtime + L"\\files.txt").c_str());
+    std::string line;
+    std::string missing;
+    int count = 0;
+    while (std::getline(in, line)) {
+      while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+      if (line.empty()) continue;
+      std::wstring name(line.begin(), line.end());
+      // The DLSS files are optional (players on other graphics cards may delete them): the game then uses FSR.
+      if (line.rfind("nvngx_", 0) == 0 || line.rfind("bbport_dlss", 0) == 0) continue;
+      if (!Exists(g_runtime + L"\\" + name)) {
+        if (++count <= 6) missing += (missing.empty() ? "" : ", ") + line;
+      }
+    }
+    if (count) {
+      LauncherLog("missing program files: " + missing + (count > 6 ? " and more" : ""));
+      return L"Some program files are missing (" + std::wstring(missing.begin(), missing.end()) +
+             (count > 6 ? L" and more" : L"") + L"). Unzip the download again; an antivirus program may have removed them.";
+    }
+  }
+  // The folders for settings and logs must be writable.
+  {
+    MakeDirs(g_data + L"\\user");
+    const std::wstring probe = g_data + L"\\user\\write_test.tmp";
+    FILE* f = _wfopen(probe.c_str(), L"wb");
+    if (!f) {
+      LauncherLog("the data folder cannot be written");
+      return L"The folder of the game cannot be written to. Move it somewhere you can write to (not Program Files).";
+    }
+    std::fclose(f);
+    DeleteFileW(probe.c_str());
+  }
+  // The archive of the game is spread over many volume files.
+  {
+    unsigned used = 0;
+    std::vector<unsigned> missing;
+    const std::string problem = DatxCheckVolumes(g_folder[0].path, g_folder[1].path, used, missing);
+    if (!problem.empty()) {
+      LauncherLog("archive check: " + problem);
+    } else if (!missing.empty()) {
+      std::string list;
+      for (size_t i = 0; i < missing.size() && i < 8; ++i) {
+        char name[24];
+        std::snprintf(name, sizeof name, "game%03u.dat", missing[i]);
+        list += (list.empty() ? "" : ", ") + std::string(name);
+      }
+      // Not a reason to refuse: a dump without some volumes may still run, until the game reads from one.
+      g_preflight_note = std::to_string(missing.size()) + " of " + std::to_string(used) + " archive volumes are missing (" + list +
+                         "); the game can crash when it needs them";
+      LauncherLog("archive check: " + g_preflight_note);
+    } else {
+      LauncherLog("archive check: all " + std::to_string(used) + " volumes present");
+    }
+  }
+  return L"";
+}
+
 std::wstring StartGame() {
   const std::wstring exe = GameExe();
   if (!Exists(exe)) return L"The game program (DriveClubGame.exe) was not found.";
@@ -864,13 +1036,14 @@ std::wstring StartGame() {
   // Add-on content: changed copies of three data lists, built from the player's own archive. Files in the mods
   // folder come first, so a player's own versions win.
   std::wstring unlock_arg;
-  bool unlock_on = true;
+  bool unlock_on = false;
   for (const Ctl& c : g_c) {
     if (c.kind == Kind::Toggle && c.patches[0] == "@unlock") unlock_on = c.sel != 0;
   }
   if (unlock_on) {
     const std::wstring unlock_dir = g_data + L"\\unlock";
     const std::wstring problem = BuildUnlock(g_folder[0].path, g_folder[1].path, unlock_dir);
+    LauncherLog(problem.empty() ? std::string("add-on content unlock: ok") : "add-on content unlock: " + Narrow(problem));
     if (problem.empty()) unlock_arg = L" --mods \"" + unlock_dir + L"\"";
     else MessageBoxW(nullptr, (L"The add-on content could not be unlocked (" + problem + L"). The game starts without it.").c_str(), L"DriveClub", MB_OK | MB_ICONWARNING);
   }
@@ -879,6 +1052,8 @@ std::wstring StartGame() {
                      L"\" --app0-base \"" + g_folder[1].path + L"\" --user \"" + user + L"\" --mods \"" + g_home + L"\\mods\"" +
                      unlock_arg + L" --stub-unresolved";
   SetEnvironmentVariableW(L"BB_GPU_USER_DIR", user.c_str());
+  SetEnvironmentVariableW(L"BB_PREFLIGHT_NOTE", g_preflight_note.empty() ? nullptr : std::wstring(g_preflight_note.begin(), g_preflight_note.end()).c_str());
+  SetEnvironmentVariableW(L"BB_CRASH_DIR", (g_home + L"\\logs").c_str());
   {
     // With the deltatime patch the game times itself by the wall clock, so each frame must be shown as soon as
     // it is finished; waiting for the next 60 Hz tick alternates 16 and 33 ms frames and shakes the camera.
@@ -913,6 +1088,28 @@ std::wstring StartGame() {
     wchar_t forced[16];
     if (GetEnvironmentVariableW(L"DRIVECLUB_MIRROR_RATE", forced, 16) > 0) SetEnvironmentVariableW(L"BB_MIRROR_RATE", forced);
   }
+  {
+    // One line of the launcher's choices for the log (without the player name and folders).
+    std::wstring version;
+    {
+      std::ifstream in((g_home + L"\\version.txt").c_str());
+      std::string line;
+      if (std::getline(in, line)) {
+        while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
+        version.assign(line.begin(), line.end());
+      }
+    }
+    std::wstring summary = L"release " + (version.empty() ? std::wstring(L"unknown") : version) + L":";
+    for (const auto& c : g_c) {
+      if (c.patches.empty() || c.patches[0] == "@name" || c.patches[0] == "@lang" || c.sel < 0) continue;
+      summary += L" ";
+      summary += c.label;
+      summary += L"=";
+      summary += c.kind == Kind::Toggle ? (c.sel ? L"on" : L"off") : (size_t(c.sel) < c.items.size() ? c.items[size_t(c.sel)] : L"?");
+      summary += L";";
+    }
+    SetEnvironmentVariableW(L"BB_SETTINGS_SUMMARY", summary.c_str());
+  }
   SetEnvironmentVariableW(L"BB_USER_NAME", g_name.c_str());
   SetEnvironmentVariableW(L"BB_FULLSCREEN", full_screen_now() ? L"1" : L"0");
   SetEnvironmentVariableW(L"BB_TOGGLE_FILE", (user + L"\\toggles.txt").c_str());
@@ -930,7 +1127,10 @@ std::wstring StartGame() {
   const std::wstring cwd = Dir(exe);
   const BOOL ok = CreateProcessW(exe.c_str(), buf.data(), nullptr, nullptr, TRUE, 0, nullptr, cwd.c_str(), &si, &pi);
   if (log != INVALID_HANDLE_VALUE) CloseHandle(log);
-  if (!ok) return L"Could not start the game.";
+  if (!ok) {
+    LauncherLog("CreateProcess failed, error " + std::to_string(GetLastError()));
+    return L"Could not start the game.";
+  }
   CloseHandle(pi.hThread);
   CloseHandle(pi.hProcess);
   return L"";
@@ -938,10 +1138,14 @@ std::wstring StartGame() {
 
 void PlayWorker() {
   SetProgress(0, L"Preparing the game...");
-  std::wstring error = RunPrepare();
+  LauncherLog("Play pressed");
+  std::wstring error = Preflight();
+  if (error.empty()) error = RunPrepare();
+  LauncherLog(error.empty() ? "preparation: ok" : "preparation: " + Narrow(error));
   if (error.empty()) {
     SetProgress(100, L"Starting DriveClub...");
     error = StartGame();
+    LauncherLog(error.empty() ? "the game was started" : "start: " + Narrow(error));
   }
   g_busy = false;
   if (error.empty()) {
@@ -1250,7 +1454,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   BuildModel();
   MakeDirs(g_data + L"\\user");
   LoadSettings();
-  if (!g_skip_gpu_check) g_gpu_problem = CheckGpu();
+  StartLauncherLog();
+  if (!g_skip_gpu_check) {
+    g_gpu_problem = CheckCpu();
+    if (g_gpu_problem.empty()) g_gpu_problem = CheckGpu();
+  }
+  LauncherLog(g_skip_gpu_check ? std::string("hardware check: skipped by the player") : g_gpu_problem.empty() ? std::string("hardware check: passed") : "hardware check: " + Narrow(g_gpu_problem));
   if (GpuBlocked()) {
     g_status = g_gpu_problem;
     g_status_color = kBad;

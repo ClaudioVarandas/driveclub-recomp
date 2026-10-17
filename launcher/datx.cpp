@@ -1,5 +1,7 @@
 #include "datx.h"
 
+#include <windows.h>
+
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
@@ -187,4 +189,66 @@ std::string DatxExtract(const std::wstring& update_dir, const std::wstring& base
     return err;
   }
   return out.size() == size ? "" : "extracted size does not match the index";
+}
+
+std::string DatxCheckVolumes(const std::wstring& update_dir, const std::wstring& base_dir, unsigned& used,
+                             std::vector<unsigned>& missing) {
+  std::vector<uint8_t> ndx;
+  if (!ReadFile(update_dir + L"\\game.ndx", ndx) && !ReadFile(base_dir + L"\\game.ndx", ndx)) return "game.ndx not found";
+  if (ndx.size() < 0x40 || memcmp(ndx.data(), "DATX", 4) != 0) return "game.ndx has an unexpected format";
+  const uint64_t filetime = Rd64(&ndx[8]);
+  const uint32_t files = Rd32(&ndx[0x38]);
+  if (files == 0 || files > 1000000) return "game.ndx has unexpected values";
+  size_t p = 0x3C;
+  const size_t half = ndx[p];
+  p += 1 + 2 * half;
+  if (p + 4 > ndx.size()) return "game.ndx is cut short";
+  const size_t names = Rd32(&ndx[p]);
+  p += 4 + names;
+  if (p + 4 > ndx.size() || Rd32(&ndx[p]) != 0x12345678u) return "game.ndx marker not found";
+  p += 4;
+  if (p + size_t(files) * 32 > ndx.size()) return "game.ndx records are cut short";
+  const uint64_t old_style = (1408492800ull + 11644473600ull) * 10000000ull;
+  std::vector<bool> seen(65536, false);
+  for (uint32_t i = 0; i < files; ++i) {
+    const uint64_t loc = Rd64(&ndx[p + size_t(i) * 32]);
+    seen[filetime <= old_style ? unsigned(loc & 0xFF) : unsigned(loc & 0xFFFF)] = true;
+  }
+  used = 0;
+  missing.clear();
+  for (unsigned vol = 0; vol < seen.size(); ++vol) {
+    if (!seen[vol]) continue;
+    ++used;
+    if (GetFileAttributesW((update_dir + L"\\" + VolumeName(vol)).c_str()) == INVALID_FILE_ATTRIBUTES &&
+        GetFileAttributesW((base_dir + L"\\" + VolumeName(vol)).c_str()) == INVALID_FILE_ATTRIBUTES)
+      missing.push_back(vol);
+  }
+  return "";
+}
+
+bool DatxContains(const std::wstring& update_dir, const std::wstring& base_dir, const std::string& path) {
+  std::vector<uint8_t> ndx;
+  if (!ReadFile(update_dir + L"\\game.ndx", ndx) && !ReadFile(base_dir + L"\\game.ndx", ndx)) return false;
+  if (ndx.size() < 0x40 || memcmp(ndx.data(), "DATX", 4) != 0) return false;
+  const uint32_t seed_a = Rd32(&ndx[0x18]), seed_b = Rd32(&ndx[0x1C]);
+  const uint32_t files = Rd32(&ndx[0x38]);
+  if (files == 0 || files > 1000000) return false;
+  size_t p = 0x3C;
+  const size_t half = ndx[p];
+  p += 1 + 2 * half;
+  if (p + 4 > ndx.size()) return false;
+  const size_t names = Rd32(&ndx[p]);
+  p += 4 + names;
+  if (p + 4 > ndx.size() || Rd32(&ndx[p]) != 0x12345678u) return false;
+  p += 4;
+  if (p + size_t(files) * 32 > ndx.size()) return false;
+  const uint8_t* rec = &ndx[p];
+  const uint32_t want = NameHash(path, seed_a, seed_b);
+  size_t lo = 0, hi = files;
+  while (lo < hi) {
+    const size_t mid = (lo + hi) / 2;
+    if (Rd32(rec + mid * 32 + 12) < want) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < files && Rd32(rec + lo * 32 + 12) == want;
 }

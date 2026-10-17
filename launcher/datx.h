@@ -9,3 +9,11 @@
 // Returns "" on success, otherwise a short description of what went wrong.
 std::string DatxExtract(const std::wstring& update_dir, const std::wstring& base_dir, const std::string& path,
                         std::vector<uint8_t>& out);
+
+// Which archive volumes (gameNNN.dat) the index uses, and which of them exist in neither folder. Returns "" on
+// success (an empty `missing` means the dump is complete), otherwise what went wrong.
+std::string DatxCheckVolumes(const std::wstring& update_dir, const std::wstring& base_dir, unsigned& used,
+                             std::vector<unsigned>& missing);
+
+// Whether `path` is in the archive whose index is in `update_dir` (or, when missing there, `base_dir`).
+bool DatxContains(const std::wstring& update_dir, const std::wstring& base_dir, const std::string& path);

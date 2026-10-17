@@ -1,0 +1,45 @@
+name: Bug report
+description: The game crashes, freezes, looks wrong or will not start
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Without the log files an issue usually cannot be solved, so please attach them. Open the folder next to `DriveClub.exe`, go into `logs`, and drag these files into the box below:
+        - the newest `driveclub_<date>_<time>.log` (one per start: take the one from the run that went wrong)
+        - `launcher.log` (it also exists when the game never started, for example when the launcher shows an error)
+        - any `crash_*.dmp` (a small file written when the game crashes)
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: The release you downloaded, for example 0.2.2 (it is in `version.txt` and at the top of the log)
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Log files
+      description: Drag the files from the `logs` folder here
+    validations:
+      required: true
+  - type: checkboxes
+    id: attached
+    attributes:
+      label: Attached
+      options:
+        - label: I attached the newest `driveclub_*.log`
+          required: true
+        - label: I attached `launcher.log`
+          required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you were doing when it went wrong (menu, loading, which event and car), what you expected and what you saw instead
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Graphics card and processor
+      description: For example "RTX 4060 Ti, Ryzen 5 5600" (the log has them too)

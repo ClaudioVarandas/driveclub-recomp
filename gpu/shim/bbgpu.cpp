@@ -1,3 +1,5 @@
+#include "bbport_recent.h"
+#include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "bbport_write_log.h"
 // bbport: glue between the C loader and the vendored shadPS4 video core.
 #include "bbport_overlay.h"
@@ -7,6 +9,7 @@
 #include <sys/resource.h>
 #endif
 #include "bbport_toggles.h"
+#include <exception>
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
@@ -214,6 +217,23 @@ static void StartProfileWriter() {
 #endif
 
 extern "C" int bbgpu_init(const BbGpuConfig* config) {
+    // An uncaught C++ exception (a Vulkan error such as a lost device, a failed allocation) says what it was.
+    std::set_terminate([] {
+        std::fputs("Fatal: unhandled C++ exception: ", stdout);
+        try {
+            if (auto error = std::current_exception()) {
+                std::rethrow_exception(error);
+            }
+        } catch (const std::exception& e) {
+            std::fputs(e.what(), stdout);
+        } catch (...) {
+            std::fputs("unknown", stdout);
+        }
+        std::fputc(10, stdout);
+        bbgpu_print_recent_passes();
+        std::fflush(nullptr);
+        _exit(21);
+    });
     BbSettings::Load();
 #ifdef BB_PGO_GENERATE
     StartProfileWriter();
@@ -281,6 +301,29 @@ extern "C" uintptr_t bbgpu_resolve(const char* scoped_nid) {
 
 extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
     return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
+}
+
+extern "C" void bbgpu_print_recent_passes(void) {
+    const u32 end = BbRecent::next.load(std::memory_order_relaxed);
+    const u32 count = std::min<u32>(end, 24);
+    if (!count) {
+        return;
+    }
+    std::fputs("Recent GPU work, oldest first:", stdout);
+    for (u32 i = end - count; i != end; ++i) {
+        const auto& e = BbRecent::entries[i & (BbRecent::Size - 1)];
+        if (e.kind == 'D') {
+            std::printf(" [draw vs %08x ps %08x idx %u inst %u]", u32(e.a), u32(e.b), e.x, e.y);
+        } else if (e.kind == 'C') {
+            std::printf(" [compute %08x %ux%ux%u]", u32(e.a), e.x, e.y, e.z);
+        }
+    }
+    std::fputc(10, stdout);
+    std::fflush(stdout);
+}
+
+extern "C" unsigned long long bbgpu_flip_count(void) {
+    return Vulkan::FrameCapture::Flips();
 }
 
 extern "C" unsigned bbgpu_symbol_count(void) {

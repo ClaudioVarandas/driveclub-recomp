@@ -67,11 +67,11 @@ The window that opens when you start `DriveClub.exe` has every setting. Press **
 
 **Anti-aliasing:** **Game** keeps the original. **FSR 3.1** works on any graphics card, **DLAA (RTX)** needs a GeForce RTX card; if it is not available the launcher falls back to FSR. Do not turn on the community patch "Disable motion blur and depth of field" with it: they do not work together and the game keeps its own anti-aliasing then.
 
-**Unlock DLC content:** on by default. Unlocks the add-on cars, bikes, tours and livery decals. The launcher reads the vehicle list, the tour list and the livery list from your own game archive and builds changed copies that the game uses. Your game folders are not modified.
+**Unlock DLC content:** off by default. Unlocks the add-on cars, bikes, tours and livery decals. The launcher reads the vehicle list, the tour list and the livery list from your own game archive and builds changed copies that the game uses. Your game folders are not modified.
 
 **Gameplay:** player name, borderless fullscreen, FPS counter, motion blur and depth of field off, no reset-to-track timer, no track barriers, and photo mode options.
 
-**Skip the graphics card check:** the launcher checks that your card can run the game (Vulkan 1.3). If it ever refuses a card that works, turn this on to start anyway.
+**Skip the hardware check:** the launcher checks that your processor and graphics card can run the game (a processor with AVX, BMI1, LZCNT and MOVBE, and Vulkan 1.3). If it ever refuses hardware that works, turn this on to start anyway.
 
 ## Known issues
 - **Some reflections are too bright**, for example rain drops on the side window and the paint on cars on the stage select screen.
@@ -86,13 +86,18 @@ The window that opens when you start `DriveClub.exe` has every setting. Press **
 - You must supply your own, legally obtained dump of the game. No game files are included.
 - **Tested with:** DriveClub, title ID `CUSA00093`, version 1.28. Other versions and repacked dumps have not been tested and may not work.
 - SmartScreen may warn (*More info*, then *Run anyway*). Verify with the checksum.
-- Requires Windows 10/11 64-bit and a graphics card with a Vulkan 1.3 driver. About 40 GB of free space is needed for the game dumps.
+- Requires Windows 10/11 64-bit, a processor from Intel Haswell (2013) or AMD Excavator or Ryzen onward, and a graphics card with a Vulkan 1.3 driver. About 40 GB of free space is needed for the game dumps.
 
 ## Building from source
 See [BUILDING.md](BUILDING.md).
 
 ## Reporting problems
-Open an [issue](../../issues) and attach the newest file from the `logs` folder, with your graphics card, driver version and what happened.
+Open an [issue](../../issues/new/choose) and fill in the form. **Attach the log files**: without them an issue usually cannot be solved. In the folder next to `DriveClub.exe`, open `logs` and drag these into the issue:
+- the newest `driveclub_<date>_<time>.log` (one per start: take the one from the run that went wrong). It starts with your Windows, processor, graphics card, driver and launcher choices, and has a status line every 30 seconds, so nothing else is needed from you.
+- `launcher.log`: what the launcher saw. It exists even when the game never started, for example when the launcher shows an error.
+- any `crash_*.dmp`: a small file written when the game crashes.
+
+Also say what you were doing when it happened (menu, loading, which event and car).
 
 ## Credits
 The community patches for DriveClub are by Kravickas, TonySSS, ZipperedRain, kalaposfos, squidbus, illusion and u/Charlie_Muggins.

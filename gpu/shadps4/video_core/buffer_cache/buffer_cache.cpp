@@ -126,7 +126,10 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
             .value();
     {
         const char* direct = std::getenv("BB_READBACK_DIRECT");
-        direct_readback = !(direct && direct[0] == '0');
+        // Reading GPU results straight from host visible memory (resizable BAR) is untested on AMD cards, which
+        // show device losses and broken frames with it: off there unless BB_READBACK_DIRECT=1 asks for it.
+        const bool amd = instance.GetVendorID() == 0x1002;
+        direct_readback = direct ? direct[0] != '0' : !amd;
         if (const auto host_type = FindHostVisibleArenaType(instance, reqs.memoryTypeBits); host_type && direct_readback) {
             arena_memory_type_index = *host_type;
             arena_host_visible = true;

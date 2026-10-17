@@ -13,6 +13,13 @@
 // Whether a param.sfo says the game is version 1.28 (its APP_VER or VERSION field).
 bool SfoIsVersion128(const std::filesystem::path& param_sfo);
 
+// Whether a folder holds the version 1.28 update: its param.sfo says so, or (when a repacked dump has another
+// version in the file) its eboot.bin is the very file of the 1.28 update.
+bool FolderIsVersion128(const std::filesystem::path& folder);
+
+// One text or number field of a param.sfo ("" when it is missing or the file cannot be read).
+std::string SfoField(const std::filesystem::path& param_sfo, const char* key);
+
 std::string PrepareGame(const std::filesystem::path& update, const std::filesystem::path& base,
                         const std::filesystem::path& work, const std::filesystem::path& patch_xml, bool patches_only,
                         const std::function<void(int, const std::string&)>& progress);

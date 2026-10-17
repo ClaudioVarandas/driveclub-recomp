@@ -34,6 +34,10 @@ int bbgpu_text_input_poll(char *out_utf8, uint64_t size);
 int bbgpu_overlay_captures_input(void);
 /* Number of symbols registered by the vendored libraries (diagnostics). */
 unsigned bbgpu_symbol_count(void);
+/* Frames presented so far (a freeze watchdog reads it). */
+unsigned long long bbgpu_flip_count(void);
+/* The last draws and dispatches recorded (shader hashes), for crash and freeze reports. */
+void bbgpu_print_recent_passes(void);
 #ifdef __cplusplus
 }
 #endif

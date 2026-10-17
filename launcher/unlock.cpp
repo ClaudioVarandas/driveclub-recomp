@@ -3,6 +3,7 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <functional>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -12,7 +13,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "unlock-1";
+constexpr const char* kVersion = "unlock-2";
 
 std::wstring Widen(const std::string& s) {
   if (s.empty()) return L"";
@@ -110,10 +111,12 @@ std::string JoinLine(const std::vector<Field>& fields) {
   return s;
 }
 
-bool PatchVehicles(std::string& text) {
+// `has_file(path)` says whether the game archive holds a file: a car is only made customisable when the template
+// of its livery editor exists (one add-on car has none, and the game stops when it is asked for it).
+bool PatchVehicles(std::string& text, const std::function<bool(const std::string&)>& has_file) {
   std::string out;
   size_t pos = 0;
-  int status = -1, versions = -1, customise = -1, player = -1, club = -1;
+  int status = -1, versions = -1, customise = -1, player = -1, club = -1, vehicle_name = -1;
   bool header = true, changed = false;
   while (pos < text.size()) {
     size_t end = text.find('\n', pos);
@@ -132,6 +135,7 @@ bool PatchVehicles(std::string& text) {
           if (f[i].text == "Status") status = int(i);
           if (f[i].text == "GameVersions") versions = int(i);
           if (f[i].text == "customise") customise = int(i);
+          if (f[i].text == "Vehicle Name") vehicle_name = int(i);
           if (f[i].text == "PlayerUnlockLevel") player = int(i);
           if (f[i].text == "ClubUnlockLevel") club = int(i);
         }
@@ -147,8 +151,12 @@ bool PatchVehicles(std::string& text) {
           changed = true;
         }
         if (customise >= 0 && f.size() > size_t(customise) && f[customise].text == "FALSE") {
-          f[customise].text = "TRUE";
-          changed = true;
+          std::string name = vehicle_name >= 0 && f.size() > size_t(vehicle_name) ? f[vehicle_name].text : "";
+          std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) { return char(std::tolower(ch)); });
+          if (!name.empty() && has_file("liveryeditor/templates/" + name + ".tmp")) {
+            f[customise].text = "TRUE";
+            changed = true;
+          }
         }
         // Cars that online club levels used to unlock are unlocked by the driver level instead.
         if (club >= 0 && player >= 0 && f.size() > size_t(std::max(club, player)) && !f[club].text.empty() &&
@@ -271,7 +279,8 @@ std::wstring BuildUnlock(const std::wstring& update_dir, const std::wstring& bas
   std::string err = DatxExtract(update_dir, base_dir, "newdata/vehicles.csv", raw);
   if (!err.empty()) return Widen("vehicle list: " + err);
   std::string vehicles(raw.begin(), raw.end());
-  if (!PatchVehicles(vehicles)) return L"the vehicle list has an unexpected layout";
+  const auto has_file = [&](const std::string& path) { return DatxContains(update_dir, base_dir, path); };
+  if (!PatchVehicles(vehicles, has_file)) return L"the vehicle list has an unexpected layout";
 
   err = DatxExtract(update_dir, base_dir, "data/databases/dc.tour", raw);
   if (!err.empty()) return Widen("tour list: " + err);

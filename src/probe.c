@@ -227,6 +227,92 @@ static void describe_address(char *out, size_t size, uintptr_t address) {
     }
     snprintf(out,size,"%p",(void *)address);
 }
+#ifdef _WIN32
+/* Diagnostics for the log: third-party modules in the process, a small crash dump, and exit markers. */
+#include <psapi.h>
+#include <dbghelp.h>
+#include <signal.h>
+
+/* DLLs loaded from outside Windows and the game's own folders (overlays, capture tools, injected code). */
+static void list_third_party_modules(FILE *out, const char *prefix) {
+    HMODULE modules[512];
+    DWORD needed = 0;
+    if (!K32EnumProcessModules(GetCurrentProcess(), modules, sizeof modules, &needed)) return;
+    char system[MAX_PATH] = "", windows[MAX_PATH] = "", own[MAX_PATH] = "";
+    GetSystemDirectoryA(system, sizeof system);
+    GetWindowsDirectoryA(windows, sizeof windows);
+    if (GetModuleFileNameA(NULL, own, sizeof own)) {
+        char *slash = strrchr(own, 92);
+        if (slash) *slash = 0;
+    }
+    int shown = 0;
+    for (DWORD i = 0; i < needed / sizeof modules[0] && shown < 24; ++i) {
+        char path[MAX_PATH];
+        if (!K32GetModuleFileNameExA(GetCurrentProcess(), modules[i], path, sizeof path)) continue;
+        if (!_strnicmp(path, system, strlen(system)) || !_strnicmp(path, windows, strlen(windows))) continue;
+        if (own[0] && !_strnicmp(path, own, strlen(own))) continue;
+        const char *name = strrchr(path, 92);
+        name = name ? name + 1 : path;
+        if (!shown) fprintf(out, "%s", prefix);
+        fprintf(out, " %s", name);
+        ++shown;
+    }
+    if (shown) fputc(10, out);
+}
+
+/* A small dump (stacks, threads, modules; no game memory) next to the log, to attach to a report. It is written by
+ * a helper thread that is waited for at most ten seconds, so a dump that hangs cannot keep the game open. */
+static EXCEPTION_POINTERS *dump_exception;
+static DWORD dump_thread_id;
+static DWORD WINAPI crash_dump_worker(LPVOID unused);
+static void write_crash_dump(EXCEPTION_POINTERS *info) {
+    dump_exception = info;
+    dump_thread_id = GetCurrentThreadId();
+    HANDLE worker = CreateThread(NULL, 0, crash_dump_worker, NULL, 0, NULL);
+    if (worker) {
+        WaitForSingleObject(worker, 10000);
+        CloseHandle(worker);
+    }
+}
+static void write_crash_dump_now(EXCEPTION_POINTERS *info, DWORD faulting_thread) {
+    const char *dir = getenv("BB_CRASH_DIR");
+    if (!dir || !*dir) return;
+    HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+    if (!dbghelp) return;
+    typedef BOOL(WINAPI * WriteDumpFn)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
+                                       PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
+    WriteDumpFn write = (WriteDumpFn)(void *)GetProcAddress(dbghelp, "MiniDumpWriteDump");
+    char path[MAX_PATH + 64];
+    snprintf(path, sizeof path, "%s%ccrash_%llu.dmp", dir, 92, (unsigned long long)GetTickCount64());
+    HANDLE file = write ? CreateFileA(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL) : INVALID_HANDLE_VALUE;
+    if (file != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION exception = {faulting_thread, info, FALSE};
+        const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), file, (MINIDUMP_TYPE)(MiniDumpNormal | MiniDumpWithThreadInfo),
+                              &exception, NULL, NULL);
+        CloseHandle(file);
+        fprintf(stderr, "  crash dump: %s%s", path, ok ? "" : " (incomplete)");
+        fputc(10, stderr);
+    }
+}
+
+static DWORD WINAPI crash_dump_worker(LPVOID unused) {
+    (void)unused;
+    write_crash_dump_now(dump_exception, dump_thread_id);
+    return 0;
+}
+
+static void note_exit(void) {
+    puts("Runtime: the process ended normally");
+    fflush(NULL);
+}
+static void on_abort(int signal_number) {
+    (void)signal_number;
+    fputs("Fatal: abort() was called (a failed check in the runtime or a library)", stderr);
+    fputc(10, stderr);
+    fflush(NULL);
+    _exit(22);
+}
+#endif
 static int fatal_reported;
 static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     if (__atomic_exchange_n(&fatal_reported,1,__ATOMIC_ACQ_REL)) { Sleep(INFINITE); }
@@ -241,9 +327,33 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     else
         fprintf(stderr,"Fault: exception 0x%08lx at %s (thread %lu)\n",record->ExceptionCode,where,GetCurrentThreadId());
     fprintf(stderr,"  uptime %llu s\n",(unsigned long long)(GetTickCount64()-start_tick)/1000ULL);
+    {
+        MEMORYSTATUSEX memory;
+        memset(&memory,0,sizeof memory);
+        memory.dwLength=sizeof memory;
+        PROCESS_MEMORY_COUNTERS counters;
+        memset(&counters,0,sizeof counters);
+        if (GlobalMemoryStatusEx(&memory) && K32GetProcessMemoryInfo(GetCurrentProcess(),&counters,sizeof counters))
+            fprintf(stderr,"  memory: process %llu MB (peak %llu MB), system free %llu of %llu MB, commit free %llu MB\n",
+                    (unsigned long long)(counters.WorkingSetSize>>20),(unsigned long long)(counters.PeakWorkingSetSize>>20),
+                    (unsigned long long)(memory.ullAvailPhys>>20),(unsigned long long)(memory.ullTotalPhys>>20),
+                    (unsigned long long)(memory.ullAvailPageFile>>20));
+    }
     fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp);
-    if (gpu_enabled) bbgpu_dump_guest_writes(info);
+    fprintf(stderr,"  r8=%016llx r9=%016llx r10=%016llx r11=%016llx\n  r12=%016llx r13=%016llx r14=%016llx r15=%016llx\n",
+            c->R8,c->R9,c->R10,c->R11,c->R12,c->R13,c->R14,c->R15);
+    {
+        unsigned char code[16];
+        SIZE_T got=0;
+        if (ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)c->Rip,code,sizeof(code),&got) && got) {
+            fprintf(stderr,"  code at rip:");
+            for (SIZE_T i=0;i<got;++i) fprintf(stderr," %02x",code[i]);
+            fputc(10,stderr);
+        }
+    }
+    list_third_party_modules(stderr,"  third-party modules:");
+    if (gpu_enabled) { bbgpu_dump_guest_writes(info); bbgpu_print_recent_passes(); }
     /* rbp chain (guest and host code keep frame pointers). */
     uintptr_t rbp=(uintptr_t)c->Rbp;
     for (int depth=0; depth<24 && rbp; ++depth) {
@@ -271,6 +381,44 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
             if (shown) fputc(10,stderr);
         }
     }
+    /* What the registers point to: eight words at each readable pointer, and the words around +0x740 of RSI (the
+     * object a crashing function was working on). */
+    {
+        const struct { const char *name; DWORD64 value; } regs[] = {
+            {"rax",c->Rax},{"rbx",c->Rbx},{"rcx",c->Rcx},{"rdx",c->Rdx},{"rsi",c->Rsi},{"rdi",c->Rdi},{"r8",c->R8},
+            {"r9",c->R9},{"r10",c->R10},{"r11",c->R11},{"r12",c->R12},{"r13",c->R13},{"r14",c->R14},{"r15",c->R15}};
+        for (size_t i=0;i<sizeof regs/sizeof regs[0];++i) {
+            uintptr_t address=(uintptr_t)regs[i].value;
+            unsigned long long words[8];
+            SIZE_T got=0;
+            if (address<0x10000 || address>0x00007fffffffffffULL) continue;
+            if (!ReadProcessMemory(GetCurrentProcess(),(void *)address,words,sizeof words,&got) || got!=sizeof words) continue;
+            fprintf(stderr,"  %s ->",regs[i].name);
+            for (int k=0;k<8;++k) fprintf(stderr," %llx",words[k]);
+            fputc(10,stderr);
+        }
+        unsigned long long object[14];
+        SIZE_T got=0;
+        if (c->Rsi>0x10000 && c->Rsi<0x00007fffffffffffULL &&
+            ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(c->Rsi+0x738),object,sizeof object,&got) && got==sizeof object) {
+            fprintf(stderr,"  rsi+0x738 ->");
+            for (int k=0;k<14;++k) fprintf(stderr," %llx",object[k]);
+            fputc(10,stderr);
+        }
+    }
+    /* The 128 bytes below the stack pointer (a leaf function's locals live there). */
+    {
+        uintptr_t below[16];
+        SIZE_T got=0;
+        if (c->Rsp>0x1000 && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)(c->Rsp-sizeof(below)),below,sizeof(below),&got) && got==sizeof(below)) {
+            fprintf(stderr,"  below rsp:");
+            for (int i=0;i<16;++i) fprintf(stderr," %llx",(unsigned long long)below[i]);
+            fputc(10,stderr);
+        }
+    }
+    write_crash_dump(info);
+    fputs("Runtime: the process was ended after the fault above",stderr);
+    fputc(10,stderr);
     fflush(NULL);
     TerminateProcess(GetCurrentProcess(),3);
     return EXCEPTION_CONTINUE_SEARCH;
@@ -550,11 +698,160 @@ void runtime_restart(void) {
 #endif
 }
 
+#ifdef _WIN32
+/* Freeze report: when no frame has been presented for 15 seconds after the game is up, the instruction pointer and
+ * stack of every thread go into the log (once per freeze, at most three times). Nothing is stopped or changed. */
+#include <tlhelp32.h>
+static DWORD WINAPI hang_watchdog(LPVOID unused) {
+    (void)unused;
+    unsigned long long last_count = 0;
+    ULONGLONG last_change = GetTickCount64();
+    int reports = 0, reported_this_freeze = 0;
+    for (;;) {
+        Sleep(1000);
+        const unsigned long long count = bbgpu_flip_count();
+        const ULONGLONG now = GetTickCount64();
+        if (count != last_count) {
+            last_count = count;
+            last_change = now;
+            reported_this_freeze = 0;
+            continue;
+        }
+        if (!count || reported_this_freeze || reports >= 3 || now - last_change < 15000) continue;
+        reported_this_freeze = 1;
+        ++reports;
+        bbgpu_print_recent_passes();
+        printf("Hang: no frame presented for %llu s (uptime %llu s); threads:", (unsigned long long)((now - last_change) / 1000),
+               (unsigned long long)((now - start_tick) / 1000));
+        fputc(10, stdout);
+        const DWORD self = GetCurrentThreadId(), pid = GetCurrentProcessId();
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if (snap == INVALID_HANDLE_VALUE) continue;
+        THREADENTRY32 te;
+        memset(&te, 0, sizeof te);
+        te.dwSize = sizeof te;
+        for (BOOL ok = Thread32First(snap, &te); ok; ok = Thread32Next(snap, &te)) {
+            if (te.th32OwnerProcessID != pid || te.th32ThreadID == self) continue;
+            HANDLE thread = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, te.th32ThreadID);
+            if (!thread) continue;
+            if (SuspendThread(thread) != (DWORD)-1) {
+                CONTEXT context;
+                memset(&context, 0, sizeof context);
+                context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                if (GetThreadContext(thread, &context)) {
+                    char where[MAX_PATH + 64];
+                    describe_address(where, sizeof where, (uintptr_t)context.Rip);
+                    printf("  thread %lu at %s; stack:", te.th32ThreadID, where);
+                    uintptr_t words[128];
+                    SIZE_T got = 0;
+                    int shown = 0;
+                    if (ReadProcessMemory(GetCurrentProcess(), (void *)(uintptr_t)context.Rsp, words, sizeof words, &got)) {
+                        for (SIZE_T i = 0; i < got / sizeof words[0] && shown < 10; ++i) {
+                            const uintptr_t off = words[i] - (uintptr_t)image;
+                            if (image && words[i] > (uintptr_t)image && (off < 0x1560000 || (off >= 0x2820000 && off < 0x3400000))) {
+                                printf(" +0x%llx", (unsigned long long)off);
+                                ++shown;
+                            }
+                        }
+                    }
+                    fputc(10, stdout);
+                }
+                ResumeThread(thread);
+            }
+            CloseHandle(thread);
+        }
+        CloseHandle(snap);
+    }
+    return 0;
+}
+#endif
+#ifdef _WIN32
+/* One block at the top of every log: processor, memory, Windows and the launcher's choices, so that a report
+ * can be understood without asking the player. */
+static void print_system_info(void) {
+    unsigned a = 0, b = 0, c = 0, d = 0;
+    char brand[64] = {0};
+    for (unsigned i = 0; i < 3; ++i) {
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000002u + i), "c"(0));
+        memcpy(brand + i * 16 + 0, &a, 4);
+        memcpy(brand + i * 16 + 4, &b, 4);
+        memcpy(brand + i * 16 + 8, &c, 4);
+        memcpy(brand + i * 16 + 12, &d, 4);
+    }
+    const char *name = brand;
+    while (*name == ' ') ++name;
+    for (size_t n = strlen(brand); n && brand[n - 1] == ' '; --n) brand[n - 1] = 0;
+    unsigned a1 = 0, c1 = 0, b7 = 0, c81 = 0, d81 = 0;
+    __asm__ volatile("cpuid" : "=a"(a1), "=b"(b), "=c"(c1), "=d"(d) : "a"(1u), "c"(0));
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b7), "=c"(c), "=d"(d) : "a"(7u), "c"(0));
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c81), "=d"(d81) : "a"(0x80000001u), "c"(0));
+    printf("CPU: %s; avx %d avx2 %d bmi1 %d movbe %d lzcnt %d sse4a %d\n", name, (c1 >> 28) & 1, (b7 >> 5) & 1,
+           (b7 >> 3) & 1, (c1 >> 22) & 1, (c81 >> 5) & 1, (c81 >> 6) & 1);
+    MEMORYSTATUSEX memory;
+    memset(&memory, 0, sizeof memory);
+    memory.dwLength = sizeof memory;
+    unsigned long long total = 0, avail = 0;
+    if (GlobalMemoryStatusEx(&memory)) {
+        total = memory.ullTotalPhys >> 20;
+        avail = memory.ullAvailPhys >> 20;
+    }
+    unsigned long major = 0, minor = 0, build = 0;
+    typedef LONG(WINAPI * RtlGetVersionFn)(OSVERSIONINFOW *);
+    HMODULE ntdll = GetModuleHandleA("ntdll.dll");
+    RtlGetVersionFn get_version = ntdll ? (RtlGetVersionFn)(void *)GetProcAddress(ntdll, "RtlGetVersion") : NULL;
+    if (get_version) {
+        OSVERSIONINFOW info;
+        memset(&info, 0, sizeof info);
+        info.dwOSVersionInfoSize = sizeof info;
+        if (get_version(&info) == 0) {
+            major = info.dwMajorVersion;
+            minor = info.dwMinorVersion;
+            build = info.dwBuildNumber;
+        }
+    }
+    printf("System: Windows %lu.%lu build %lu, %llu MB memory (%llu MB free)\n", major, minor, build, total, avail);
+    if (ntdll && GetProcAddress(ntdll, "wine_get_version")) {
+        typedef const char *(CDECL * WineVersionFn)(void);
+        WineVersionFn wine = (WineVersionFn)(void *)GetProcAddress(ntdll, "wine_get_version");
+        printf("System: running under Wine/Proton %s", wine ? wine() : "?");
+        fputc(10, stdout);
+    }
+    const char *summary = getenv("BB_SETTINGS_SUMMARY");
+    if (summary && *summary) printf("Launcher: %s\n", summary);
+    {
+        const char *note = getenv("BB_PREFLIGHT_NOTE");
+        if (note && *note) printf("Launcher warning: %s\n", note);
+    }
+    /* BB_* variables that test scripts or the launcher set (the ones that hold paths or names are left out). */
+    {
+        char *block = GetEnvironmentStringsA();
+        if (block) {
+            int shown = 0;
+            for (const char *entry = block; *entry; entry += strlen(entry) + 1) {
+                if (strncmp(entry, "BB_", 3) != 0) continue;
+                if (!strncmp(entry, "BB_SETTINGS_SUMMARY=", 20) || !strncmp(entry, "BB_USER_NAME=", 13) ||
+                    !strncmp(entry, "BB_CRASH_DIR=", 13) || !strncmp(entry, "BB_GPU_USER_DIR=", 16) ||
+                    !strncmp(entry, "BB_CONFIG=", 10) || !strncmp(entry, "BB_TOGGLE_FILE=", 15) ||
+                    !strncmp(entry, "BB_DUMP_DIR=", 12) || !strncmp(entry, "BB_CAPTURE_DIR=", 15))
+                    continue;
+                if (!shown) printf("Environment:");
+                printf(" %s", entry);
+                ++shown;
+            }
+            if (shown) fputc(10, stdout);
+            FreeEnvironmentStringsA(block);
+        }
+    }
+}
+#endif
 int main(int argc, char **argv) {
 #ifdef _WIN32
     start_tick=GetTickCount64();
 #endif
     setvbuf(stdout, NULL, _IONBF, 0);
+#ifdef _WIN32
+    print_system_info();
+#endif
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
        non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
@@ -620,6 +917,8 @@ int main(int argc, char **argv) {
     SYSTEM_INFO system_info; GetSystemInfo(&system_info); page_size = system_info.dwPageSize;
     AddVectoredExceptionHandler(1, vectored_fault);
     SetUnhandledExceptionFilter(unhandled_fault);
+    atexit(note_exit);
+    signal(SIGABRT,on_abort);
     if (getenv("BB_STRICT_HANDLES")) {
         PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY strict={0};
         strict.RaiseExceptionOnInvalidHandleReference=1;
@@ -757,6 +1056,10 @@ int main(int argc, char **argv) {
         gpu_enabled=1; /* page tracking starts while the rasterizer registers guest memory */
         if (bbgpu_init(&gpu)) fail("GPU initialization failed");
         printf("GPU: window and Vulkan presenter ready; SDK 0x%08x, %u HLE symbols\n",(unsigned)sdk,bbgpu_symbol_count());
+#ifdef _WIN32
+        CreateThread(NULL,0,hang_watchdog,NULL,0,NULL);
+        list_third_party_modules(stdout,"Third-party modules:");
+#endif
     }
     unsigned char *traps = allocate(round_page((import_count + 1) * 32));
     unsigned char *data_traps = allocate((import_count + 1) * page_size);
