@@ -90,6 +90,8 @@ float g_scale = 1.f, g_content_h = 0, g_ox = 0, g_oy = 0;
 constexpr float kMaxW = 1700.f;
 float g_win_w = kWinW;       // logical window width: the layout reflows when the window is widened
 float g_win_h = 0;           // logical window height; 0 or less than the content: as tall as the content needs
+float g_client_h = 0;        // client height in pixels
+float g_scroll = 0;          // pixels the content is scrolled up when the window is shorter than it
 float g_natural_h = 0;       // the height the content needs
 float g_row_extra = 0;       // extra space given to every row when the window is taller than the content
 int g_hover_ctl = -1, g_hover_seg = -1, g_hover_btn = -1, g_hover_browse = -1, g_press_btn = -1;
@@ -491,6 +493,12 @@ void Layout() {
 
 float TotalHeight() { return g_content_h + kFooterH; }
 
+// A window shorter than the content scrolls it (mouse wheel); the footer stays at the bottom.
+float MaxScroll() { return g_client_h > 0 ? (std::max)(0.f, TotalHeight() * g_scale - g_client_h) : 0.f; }
+float ContentOy() { return -g_scroll; }
+float FooterOy() { return g_client_h > 0 ? (std::min)(0.f, g_client_h - TotalHeight() * g_scale) : 0.f; }
+float FooterTop() { return FooterOy() + g_content_h * g_scale; }
+
 // ------------------------------------------------------------------------------------------
 // painting
 // ------------------------------------------------------------------------------------------
@@ -542,6 +550,7 @@ void Paint(HDC hdc, int w, int h) {
   g.Clear(kBg);
   FontFamily fam(L"Segoe UI");
   const float S = g_scale;
+  g_oy = ContentOy();
   Font fTitle(&fam, 22 * S, FontStyleBold, UnitPixel), fSub(&fam, 13 * S, FontStyleRegular, UnitPixel),
       fCard(&fam, 12 * S, FontStyleBold, UnitPixel), fLabel(&fam, 14 * S, FontStyleRegular, UnitPixel),
       fSegBold(&fam, 13 * S, FontStyleBold, UnitPixel), fHint(&fam, 12.5f * S, FontStyleRegular, UnitPixel),
@@ -642,6 +651,7 @@ void Paint(HDC hdc, int w, int h) {
   }
 
   // footer: hint / status / progress, buttons
+  g_oy = FooterOy();
   const float fy = g_oy + g_content_h * S;
   SolidBrush footer_brush(Color(255, 12, 13, 16));
   g.FillRectangle(&footer_brush, 0.f, fy, float(w), float(h) - fy);
@@ -692,6 +702,7 @@ void Paint(HDC hdc, int w, int h) {
     FillRound(g, br, 10 * S, fill);
     Text(g, kBtnText[i], fBtn, br, disabled ? kMuted : kWhite, StringAlignmentCenter);
   }
+  g_oy = ContentOy();
 }
 
 // ------------------------------------------------------------------------------------------
@@ -889,6 +900,7 @@ void StartNameEdit(HWND parent, const Ctl& c) {
 }
 
 int HitControl(float x, float y, int* seg) {
+  if (y >= FooterTop()) { *seg = -1; return -1; }
   *seg = -1;
   for (size_t i = 0; i < g_c.size(); ++i) {
     Ctl& c = g_c[i];
@@ -906,6 +918,9 @@ int HitControl(float x, float y, int* seg) {
 }
 
 int HitButton(float x, float y) {
+  const float content_oy = g_oy;
+  g_oy = FooterOy();
+  struct Restore { float v; ~Restore() { g_oy = v; } } restore{content_oy};
   for (int i = 0; i < 3; ++i) {
     RectF r = Scaled(g_btn[i]);
     if (x >= r.X && x <= r.X + r.Width && y >= r.Y && y <= r.Y + r.Height) return i;
@@ -914,6 +929,7 @@ int HitButton(float x, float y) {
 }
 
 int HitBrowse(float x, float y) {
+  if (y >= FooterTop()) return -1;
   for (int i = 0; i < 2; ++i) {
     RectF r = Scaled(g_folder[i].browse);
     if (x >= r.X && x <= r.X + r.Width && y >= r.Y && y <= r.Y + r.Height) return i;
@@ -928,7 +944,10 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       if (w == SIZE_MINIMIZED || g_scale <= 0.f) return 0;
       g_win_w = (std::max)(kWinW, (std::min)(kMaxW, float(LOWORD(l)) / g_scale));
       g_win_h = float(HIWORD(l)) / g_scale;
+      g_client_h = float(HIWORD(l));
       Layout();
+      g_scroll = (std::min)(g_scroll, MaxScroll());
+      g_oy = ContentOy();
       InvalidateRect(h, nullptr, FALSE);
       return 0;
     }
@@ -939,7 +958,7 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       const int ncw = (wr.right - wr.left) - cr.right, nch = (wr.bottom - wr.top) - cr.bottom;
       auto* mm = reinterpret_cast<MINMAXINFO*>(l);
       mm->ptMinTrackSize.x = LONG(kWinW * g_scale) + ncw;
-      mm->ptMinTrackSize.y = LONG((g_natural_h > 0 ? g_natural_h : TotalHeight()) * g_scale) + nch;
+      mm->ptMinTrackSize.y = LONG((kHeaderH + kFooterH + 160.f) * g_scale) + nch;  // shorter: the content scrolls
       mm->ptMaxTrackSize.x = LONG(kMaxW * g_scale) + ncw;
       return 0;
     }
@@ -969,6 +988,17 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
     case WM_ERASEBKGND:
       return 1;
+    case WM_MOUSEWHEEL: {
+      const float before = g_scroll;
+      g_scroll -= float(GET_WHEEL_DELTA_WPARAM(w)) / WHEEL_DELTA * 60.f * g_scale;
+      g_scroll = (std::max)(0.f, (std::min)(g_scroll, MaxScroll()));
+      if (g_scroll != before) {
+        CommitName();  // the name box is a child window placed at the old position
+        g_oy = ContentOy();
+        InvalidateRect(h, nullptr, FALSE);
+      }
+      return 0;
+    }
     case WM_MOUSEMOVE: {
       const float x = float(GET_X_LPARAM(l)), y = float(GET_Y_LPARAM(l));
       int seg;
@@ -1163,6 +1193,12 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME;  // every edge and corner resizes
   RECT rc{0, 0, LONG(kWinW * g_scale), LONG(TotalHeight() * g_scale)};
   AdjustWindowRect(&rc, style, FALSE);
+  {
+    // On a screen too short for the whole layout (1440p at 150%), start as tall as the screen allows.
+    RECT work{};
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0) && rc.bottom - rc.top > work.bottom - work.top)
+      rc.bottom = rc.top + (work.bottom - work.top);
+  }
   g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"DriveClub - PC", style,
                            (GetSystemMetrics(SM_CXSCREEN) - (rc.right - rc.left)) / 2,
                            (GetSystemMetrics(SM_CYSCREEN) - (rc.bottom - rc.top)) / 2, rc.right - rc.left,
