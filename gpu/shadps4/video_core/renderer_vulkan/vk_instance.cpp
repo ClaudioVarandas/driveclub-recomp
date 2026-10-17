@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstdio>
 #include <boost/container/static_vector.hpp>
 #include <fmt/format.h>
 #include <fmt/ranges.h>
@@ -172,6 +173,23 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
     format_properties = GetFormatProperties(physical_device);
     properties = physical_device.getProperties();
     memory_properties = physical_device.getMemoryProperties();
+    {
+        // For support: which card, which driver (NVIDIA packs its driver version differently).
+        const u32 driver = properties.driverVersion;
+        if (properties.vendorID == 0x10DE) {
+            std::printf("GPU: %s (vendor %04x, device %04x), NVIDIA driver %u.%u.%u.%u, Vulkan %u.%u.%u\n",
+                        properties.deviceName.data(), properties.vendorID, properties.deviceID,
+                        (driver >> 22) & 0x3ff, (driver >> 14) & 0xff, (driver >> 6) & 0xff, driver & 0x3f,
+                        VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion),
+                        VK_VERSION_PATCH(properties.apiVersion));
+        } else {
+            std::printf("GPU: %s (vendor %04x, device %04x), driver %u.%u.%u (0x%08x), Vulkan %u.%u.%u\n",
+                        properties.deviceName.data(), properties.vendorID, properties.deviceID,
+                        VK_VERSION_MAJOR(driver), VK_VERSION_MINOR(driver), VK_VERSION_PATCH(driver), driver,
+                        VK_VERSION_MAJOR(properties.apiVersion), VK_VERSION_MINOR(properties.apiVersion),
+                        VK_VERSION_PATCH(properties.apiVersion));
+        }
+    }
     CollectDeviceParameters();
     ASSERT_MSG(properties.apiVersion >= TargetVulkanApiVersion,
                "Vulkan {}.{} is required, but only {}.{} is supported by device!",

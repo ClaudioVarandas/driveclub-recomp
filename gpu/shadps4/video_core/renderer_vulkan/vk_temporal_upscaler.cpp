@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_gpu_profiler.h"
+#include "video_core/renderer_vulkan/vk_drive_motion.h"
 #include "video_core/renderer_vulkan/motion_history.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/renderer_vulkan/ui_composition.h"
@@ -25,6 +26,7 @@
 #include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
+#include "video_core/renderer_vulkan/vk_frame_generation.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -161,6 +163,7 @@ TemporalUpscaler::TemporalUpscaler(const Instance& instance_, Scheduler& schedul
                                    CameraMotion& camera_motion_, SceneTargets& scene_targets_)
     : instance{instance_}, scheduler{scheduler_}, texture_cache{texture_cache_},
       runtime{runtime_}, camera_motion{camera_motion_}, scene_targets{scene_targets_} {
+    drive_motion = std::make_unique<DriveMotion>(instance);
     // Reject unsupported shaders before allocating resources or recording a frame.
     BbSettings::ConfigureUpscalerSupport(instance.IsFsr4Int8Supported(),
                                          instance.IsFsr411Supported());
@@ -2024,6 +2027,82 @@ bool TemporalUpscaler::RecordDlss(vk::CommandBuffer cmdbuf, const Dlss::Resource
         reset = true;
     }
     return ok;
+}
+
+void TemporalUpscaler::CaptureFrameGen(VideoCore::ImageId depth_id, u64 address) {
+    if (!frame_generator || !frame_generator->Wanted() || frame_generator->Paused() || !depth_id) {
+        return;
+    }
+    auto& depth = texture_cache.GetImage(depth_id);
+    const u32 w = depth.info.size.width, h = depth.info.size.height;
+    scheduler.EndRendering();
+    const vk::ImageView depth_view =
+        CachedView(depth, depth.info.pixel_format, vk::ImageAspectFlagBits::eDepth);
+    runtime.Transit(&depth, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderRead);
+    runtime.FlushBarriers();
+    const auto cmdbuf = scheduler.CommandBuffer();
+    if (const vk::ImageView motion = frame_generator->BeginCapture(cmdbuf, depth_view, w, h, address)) {
+        // The camera of the game's own anti-aliasing pass; without it (menus) the motion is zero
+        // and the optical flow of the frame generation estimates it.
+        FrameGenCamera camera{};
+        camera.near_plane = 0.02f;
+        camera.far_plane = 3000.0f;
+        camera.vertical_fov = 0.9f;
+        const bool dlss = BbSettings::Get().frame_gen == BbSettings::FrameGenDlss;
+        const bool have_camera = drive_motion->Ready();
+        if (have_camera) {
+            // DLSS takes screen fractions (its scale is 1), FSR takes pixels.
+            const auto size = frame_generator->InputSize();
+            drive_motion->Record(cmdbuf, depth_view, motion, size[0], size[1], w, h, dlss);
+            camera.near_plane = drive_motion->Near();
+            camera.vertical_fov = drive_motion->VerticalFov();
+            drive_motion->ClipTransforms(camera.view_to_clip, camera.clip_to_prev_clip,
+                                         camera.prev_clip_to_clip);
+            camera.has_matrices = true;
+            drive_motion->Consume();
+        } else {
+            frame_generator->ZeroMotion(cmdbuf);
+        }
+        static bool announced = false;
+        if (have_camera && !announced) {
+            announced = true;
+            std::printf("Frame generation: motion vectors from the game camera, fov %.1f deg", camera.vertical_fov * 57.2958f);
+            std::puts("");
+        }
+        frame_generator->EndCapture(cmdbuf, {}, true, camera);
+    }
+}
+
+namespace {
+bool Rgba8(vk::Format format) {
+    return format == vk::Format::eR8G8B8A8Unorm || format == vk::Format::eR8G8B8A8Srgb ||
+           format == vk::Format::eB8G8R8A8Unorm || format == vk::Format::eB8G8R8A8Srgb;
+}
+} // namespace
+
+void TemporalUpscaler::CaptureHudless(VideoCore::ImageId color, u64 address) {
+    if (!frame_generator || !frame_generator->Wanted() || frame_generator->Paused() || !color) {
+        return;
+    }
+    static const bool hudless_wanted = [] {
+        const char* env = std::getenv("BB_FRAME_GEN_HUDLESS");
+        return !(env && env[0] == '0');
+    }();
+    if (!hudless_wanted) {
+        return;
+    }
+    auto& image = texture_cache.GetImage(color);
+    if (!Rgba8(image.info.pixel_format)) {
+        return;
+    }
+    scheduler.EndRendering();
+    runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+    frame_generator->CaptureHudless(scheduler.CommandBuffer(), image.GetImage(),
+                                    image.info.pixel_format, image.info.size.width,
+                                    image.info.size.height, address);
 }
 
 } // namespace Vulkan

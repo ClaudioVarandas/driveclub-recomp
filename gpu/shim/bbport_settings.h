@@ -19,6 +19,13 @@ inline bool IsFsr4(int upscaler) {
 }
 enum Preset : int { NativeAA = 0, Quality, Balanced, Performance, UltraPerformance, PresetCount };
 enum DebugView : int { DebugNone = 0, DebugReactive = 1, DebugMotion = 2, DebugViewCount };
+/// Frame generation (vk_frame_generation.h): frames generated between two of the game's.
+enum FrameGen : int { FrameGenOff = 0, FrameGenFsr3 = 1, FrameGenDlss = 2, FrameGenCount };
+/// Anti-aliasing at the render resolution: the game's own, FSR 3.1, or DLSS (DLAA).
+enum Aa : int { AaOff = 0, AaFsr3 = 1, AaDlss = 2, AaCount };
+/// Upscaling with the anti-aliasing: render size to output size (Native, Quality 1.5x, Balanced 1.7x,
+/// Performance 2x).
+enum AaScale : int { AaScaleNative = 0, AaScaleQuality = 1, AaScaleBalanced = 2, AaScalePerformance = 3, AaScaleCount };
 
 /// Game effects switched by the community patches at start (patches.py EFFECTS): ini key,
 /// menu label, default (the game's own behaviour).
@@ -98,6 +105,31 @@ struct Values {
     std::atomic<const char*> dlss_problem{nullptr};
 
     /// Startup settings for the explicit BB_RENDER_RES compatibility patch only.
+    /// Frame generation and the frames per game frame (2x with FSR 3.1, up to 4x with DLSS on
+    /// RTX 50). dlssg_max_multiplier: 1 without DLSS Frame Generation.
+    std::atomic<int> frame_gen{FrameGenOff};
+    std::atomic<int> aa_mode{AaOff};
+    /// F8: frame generation stays set up but stops capturing and generating (nothing is freed).
+    std::atomic<bool> frame_gen_paused{false};
+    std::atomic<int> aa_scale{AaScaleNative};
+    /// The anti-aliasing replaced the game's result in the last frame (for the overlay).
+    std::atomic<bool> aa_running{false};
+    std::atomic<int> frame_gen_multiplier{2};
+    /// At most the frames the display shows between two of the game's (an uncapped game then
+    /// gets fewer generated frames); off: the multiplier as chosen.
+    std::atomic<bool> frame_gen_fit_display{false};
+    std::atomic<int> dlssg_max_multiplier{1};
+    std::atomic<const char*> frame_gen_problem{nullptr};
+    /// Generated frames per game frame the display has room for now (0: paused), and its
+    /// refresh rate (the presenter's measure).
+    std::atomic<int> frame_gen_now{0};
+    std::atomic<int> frame_gen_display_hz{0};
+    /// The game's own frame rate (presenter, game frames only).
+    std::atomic<float> game_fps{0.0f};
+    /// The game's frame rate cap frame generation needs (VideoOut applies it), 0 for none: with
+    /// FIFO presentation (V-Sync) at most refresh / (generated + 1).
+    std::atomic<int> frame_gen_flip_limit{0};
+    /// Startup settings for the explicit BB_RENDER_RES compatibility patch only.
     int startup_preset = NativeAA;
     int startup_upscaler = UpscalerFsr3;
     bool startup_object_motion = true;
@@ -126,5 +158,9 @@ void Save();
 float PresetScale(int preset);
 const char* PresetName(int preset);
 const char* UpscalerName(int upscaler);
+const char* FrameGenName(int frame_gen);
+const char* AaName(int aa);
+const char* AaScaleName(int scale);
+float AaScaleFactor(int scale);
 
 } // namespace BbSettings

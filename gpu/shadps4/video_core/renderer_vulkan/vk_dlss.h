@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <array>
 #include <memory>
 #include <string>
 #include <vector>
@@ -30,6 +31,8 @@ public:
                                 std::vector<const char*>& enabled);
     /// After the device exists.
     void Initialize(vk::Instance instance, vk::PhysicalDevice physical, vk::Device device);
+    /// The device could not be made with DLSS's extensions: DLSS stays off this run.
+    void Disable(const std::string& reason);
     void Shutdown();
 
     [[nodiscard]] bool Available() const;
@@ -47,6 +50,7 @@ public:
         u32 input_width, input_height, output_width, output_height;
         int quality;
         bool hdr;
+        bool depth_inverted = false;
         bool operator==(const FeatureDesc&) const = default;
     };
     struct Frame {
@@ -64,6 +68,34 @@ public:
     bool CreateFeature(vk::CommandBuffer command, const FeatureDesc& desc);
     bool Evaluate(vk::CommandBuffer command, const Frame& frame);
     void ReleaseFeature();
+
+    // DLSS Frame Generation (nvngx_dlssg.dll, GeForce RTX 40 and newer).
+
+    /// Frames it can generate per pair of rendered frames: 0 none, 1 (2x), 3 (4x, RTX 50).
+    [[nodiscard]] int FrameGenMaxCount() const;
+    struct FrameGenDesc {
+        u32 width, height; ///< backbuffer
+        vk::Format format;
+        u32 render_width, render_height; ///< depth and motion vectors
+        bool operator==(const FrameGenDesc&) const = default;
+    };
+    struct FrameGenFrame {
+        Resource backbuffer, depth, motion, output; ///< General layout
+        Resource hudless; ///< the backbuffer before the UI, General; image null when none
+        float jitter_x, jitter_y;
+        float camera_near, camera_far, camera_fov;
+        bool depth_inverted;
+        /// Row-vector clip-space matrices; without them a still camera is assumed.
+        bool has_matrices;
+        std::array<float, 16> view_to_clip, clip_to_prev_clip, prev_clip_to_clip;
+        bool reset;
+        u32 count, index; ///< generated frames for this pair, and which one (1-based)
+    };
+    [[nodiscard]] bool HasFrameGen(const FrameGenDesc& desc) const;
+    /// Records the feature creation. The GPU must be done with the previous one.
+    bool CreateFrameGen(vk::CommandBuffer command, const FrameGenDesc& desc);
+    bool EvaluateFrameGen(vk::CommandBuffer command, const FrameGenFrame& frame);
+    void ReleaseFrameGen();
 
 private:
     Dlss();

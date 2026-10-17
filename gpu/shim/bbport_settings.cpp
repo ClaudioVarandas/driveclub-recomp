@@ -50,6 +50,28 @@ void Set(Values& v, const std::string& key, const std::string& value) {
         v.reactive_max = Clamp(f, 0.0f, 1.0f);
     } else if (key == "debug_view") {
         v.debug_view = std::clamp(i, 0, DebugViewCount - 1);
+    } else if (key == "frame_gen") {
+        for (int g = 0; g < FrameGenCount; ++g) {
+            if (value == FrameGenName(g)) {
+                v.frame_gen = g;
+            }
+        }
+    } else if (key == "aa") {
+        for (int a = 0; a < AaCount; ++a) {
+            if (value == AaName(a)) {
+                v.aa_mode = a;
+            }
+        }
+    } else if (key == "aa_scale") {
+        for (int a = 0; a < AaScaleCount; ++a) {
+            if (value == AaScaleName(a)) {
+                v.aa_scale = a;
+            }
+        }
+    } else if (key == "frame_gen_multiplier") {
+        v.frame_gen_multiplier = std::clamp(i, 2, 4);
+    } else if (key == "frame_gen_fit_display") {
+        v.frame_gen_fit_display = i != 0;
     } else if (key == "show_fps") {
         v.show_fps = i != 0;
     } else if (key == "fsr4_auto_exposure") {
@@ -113,6 +135,8 @@ void Load() {
         {"BB_REACTIVE", "reactive"},              {"BB_REACTIVE_SCALE", "reactive_scale"},
         {"BB_REACTIVE_THRESHOLD", "reactive_threshold"}, {"BB_REACTIVE_MAX", "reactive_max"},
         {"BB_UPSCALE_PRESET", "preset"},            {"BB_OBJECT_MOTION", "object_motion"},
+        {"BB_AA", "aa"},                            {"BB_AA_SCALE", "aa_scale"},                            {"BB_FRAME_GEN", "frame_gen"},              {"BB_FRAME_GEN_MULTIPLIER", "frame_gen_multiplier"},
+        {"BB_FRAME_GEN_FIT_DISPLAY", "frame_gen_fit_display"},
     };
     for (const auto& [env, key] : env_keys) {
         if (const char* value = std::getenv(env)) {
@@ -195,6 +219,13 @@ void Save() {
                  v.reactive_scale.load(), v.reactive_threshold.load(), v.reactive_max.load(),
                  v.debug_view.load(), int(v.show_fps.load()),
                  int(v.fsr4_auto_exposure.load()), int(v.fsr4_invert_jitter.load()));
+    std::fprintf(file, "aa_scale=%s", AaScaleName(v.aa_scale));
+    std::fputc(10, file);
+    std::fprintf(file, "aa=%s", AaName(v.aa_mode));
+    std::fputc(10, file);
+    std::fprintf(file, "frame_gen=%s\nframe_gen_multiplier=%d\nframe_gen_fit_display=%d\n",
+                 FrameGenName(v.frame_gen), v.frame_gen_multiplier.load(),
+                 int(v.frame_gen_fit_display.load()));
     // Read by patches.py at start.
     for (int e = 0; e < EffectCount; ++e) {
         std::fprintf(file, "%s=%d\n", Effects[e].key, int(v.effects[e].load()));
@@ -216,6 +247,26 @@ const char* PresetName(int preset) {
     static constexpr const char* names[PresetCount] = {"Native AA", "Quality", "Balanced",
                                                        "Performance", "Ultra Performance"};
     return names[std::clamp(preset, 0, PresetCount - 1)];
+}
+
+const char* FrameGenName(int frame_gen) {
+    static constexpr const char* names[FrameGenCount] = {"off", "fsr3", "dlss"};
+    return names[std::clamp(frame_gen, 0, FrameGenCount - 1)];
+}
+
+const char* AaName(int aa) {
+    static constexpr const char* names[AaCount] = {"off", "fsr3", "dlss"};
+    return names[std::clamp(aa, 0, AaCount - 1)];
+}
+
+const char* AaScaleName(int scale) {
+    static constexpr const char* names[AaScaleCount] = {"native", "quality", "balanced", "performance"};
+    return names[std::clamp(scale, 0, AaScaleCount - 1)];
+}
+
+float AaScaleFactor(int scale) {
+    static constexpr float factors[AaScaleCount] = {1.0f, 1.5f, 1.7f, 2.0f};
+    return factors[std::clamp(scale, 0, AaScaleCount - 1)];
 }
 
 const char* UpscalerName(int upscaler) {

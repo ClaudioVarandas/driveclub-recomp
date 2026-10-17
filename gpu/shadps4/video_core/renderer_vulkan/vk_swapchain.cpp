@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "bbport_settings.h"
 #include <algorithm>
 #include <limits>
 #include "common/assert.h"
@@ -235,7 +236,9 @@ void Swapchain::SetSurfaceProperties() {
     }
 
     // Select number of images in swap chain, we prefer one buffer in the background to work on
-    image_count = capabilities.minImageCount + 1;
+    // (bbport: two with frame generation, which presents several images per game frame).
+    image_count = capabilities.minImageCount +
+                  (BbSettings::Get().frame_gen != BbSettings::FrameGenOff ? 2 : 1);
     if (capabilities.maxImageCount > 0) {
         image_count = std::min(image_count, capabilities.maxImageCount);
     }

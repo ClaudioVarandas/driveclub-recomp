@@ -25,6 +25,10 @@ cp packaging/release/README.txt packaging/release/THIRD_PARTY_NOTICES.txt LICENS
 ldd out/DriveClubGame.exe | awk '{print $3}' | grep -i '/msys64/' | sort -u | while read -r dll; do
   cp "$dll" "$OUT/runtime/"
 done
+# DLSS frame generation: the bridge built from gpu/dlss_bridge and NVIDIA's DLSS libraries.
+cp packaging/dlss_bin/bbport_dlss.dll packaging/dlss_bin/nvngx_dlss.dll packaging/dlss_bin/nvngx_dlssg.dll "$OUT/runtime/"
+mkdir -p "$OUT/licenses"
+cp packaging/dlss/NVIDIA-DLSS-LICENSE.txt packaging/dlss/dlss_bridge-LICENSE.txt "$OUT/licenses/"
 # DLLs the game program loads by name at run time.
 for extra in SDL3.dll; do
   [ -f "out/$extra" ] && cp "out/$extra" "$OUT/runtime/" || true

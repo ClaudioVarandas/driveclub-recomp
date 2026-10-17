@@ -3,6 +3,10 @@
 #include <string>
 #include <vector>
 #include "bbport_overlay.h"
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
 
 #include <atomic>
 #include <cfloat>
@@ -44,6 +48,9 @@ asm(".section .rodata\n"
 extern "C" const unsigned char bb_font_ttf[];
 extern "C" const unsigned char bb_font_ttf_end[];
 
+
+static bool g_aa_used = false;
+static bool g_fg_used = false;
 
 namespace BbOverlay {
 
@@ -148,7 +155,69 @@ void FpsCounter() {
                  ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                      ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoNav |
                      ImGuiWindowFlags_NoFocusOnAppearing);
-    ImGui::Text("%.0f FPS  %.1f ms", frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f, frame_ms_avg);
+    {
+        auto& s = BbSettings::Get();
+#ifdef _WIN32
+        {
+            // F9: anti-aliasing on and off, F10: FSR 3.1 and DLAA (for comparing).
+            static bool f9_down = false, f10_down = false;
+            static int remembered = BbSettings::AaFsr3;
+            const bool f9 = (GetAsyncKeyState(VK_F9) & 0x8000) != 0;
+            const bool f10 = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+            if (s.aa_mode != BbSettings::AaOff) {
+                remembered = s.aa_mode;
+                g_aa_used = true;
+            }
+            if (f9 && !f9_down) {
+                s.aa_mode = s.aa_mode != BbSettings::AaOff ? int(BbSettings::AaOff) : remembered;
+            }
+            if (f10 && !f10_down && s.dlss_supported) {  // DLSS only where this card can run it
+                remembered = remembered == BbSettings::AaDlss ? int(BbSettings::AaFsr3)
+                                                              : int(BbSettings::AaDlss);
+                if (s.aa_mode != BbSettings::AaOff) {
+                    s.aa_mode = remembered;
+                }
+            }
+            f9_down = f9;
+            f10_down = f10;
+            // F8: frame generation paused and resumed (everything stays set up).
+            static bool f8_down = false;
+            const bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+            if (s.frame_gen != BbSettings::FrameGenOff) {
+                g_fg_used = true;
+                if (f8 && !f8_down) {
+                    s.frame_gen_paused = !s.frame_gen_paused;
+                }
+            }
+            f8_down = f8;
+        }
+#endif
+        const float shown = frame_ms_avg > 0.0f ? 1000.0f / frame_ms_avg : 0.0f;
+        if (s.frame_gen != BbSettings::FrameGenOff && s.frame_gen_now.load() > 0 && s.game_fps > 0.0f) {
+            ImGui::Text("%.0f FPS (game %.0f)", shown, s.game_fps.load());
+        } else {
+            ImGui::Text("%.0f FPS  %.1f ms", shown, frame_ms_avg);
+        }
+        if (s.frame_gen != BbSettings::FrameGenOff) {
+            if (s.frame_gen_paused) {
+                ImGui::Text("Frame generation: paused  (F8 on)");
+            } else {
+                ImGui::Text("Frame generation: %s %dx  (F8 pause)",
+                            s.frame_gen == BbSettings::FrameGenDlss ? "DLSS" : "FSR 3.1",
+                            s.frame_gen == BbSettings::FrameGenDlss ? s.frame_gen_multiplier.load() : 2);
+            }
+        }
+        if (s.aa_mode != BbSettings::AaOff) {
+            const bool up = s.aa_scale != BbSettings::AaScaleNative;
+            ImGui::Text("%s: %s%s%s%s  (%s)", up ? "Upscaling" : "AA",
+                        s.aa_mode == BbSettings::AaDlss ? (up ? "DLSS" : "DLAA") : "FSR 3.1",
+                        up ? " " : "", up ? BbSettings::AaScaleName(s.aa_scale) : "",
+                        s.aa_running ? " on" : " waiting",
+                        s.dlss_supported ? "F9 off, F10 FSR/DLSS" : "F9 off");
+        } else if (g_aa_used) {
+            ImGui::Text("AA: game  (F9 on)");
+        }
+    }
     static unsigned shown_w, shown_h, frames;
     if (++frames % 60 == 0) {
         shown_w = BbFrame::scene_w.exchange(0);
@@ -325,6 +394,8 @@ void SetTextEntry(bool active, const std::string& prompt, const std::string& tex
     text_entry_prompt = prompt;
     text_entry_text = text;
 }
+
+void NotePresent() {}
 
 void Render(vk::CommandBuffer cmdbuf, vk::ImageView view, vk::Extent2D extent) {
     // Present interval for the FPS readout (measured also while nothing is drawn).

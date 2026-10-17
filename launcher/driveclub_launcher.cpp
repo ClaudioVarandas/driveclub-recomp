@@ -86,6 +86,7 @@ FolderRow g_folder[2];  // 0 = update, 1 = base game
 std::wstring g_home, g_data, g_runtime;
 HWND g_hwnd = nullptr;
 HWND g_edit = nullptr;  // the in-place box for the player name
+float g_dpi = 1.f;  // the display scale; g_scale is what is drawn at (smaller when the window is too short)
 float g_scale = 1.f, g_content_h = 0, g_ox = 0, g_oy = 0;
 constexpr float kMaxW = 1700.f;
 float g_win_w = kWinW;       // logical window width: the layout reflows when the window is widened
@@ -168,7 +169,20 @@ bool FileHas(const std::wstring& path, const char* text) {
 // The base game dump has an eboot.bin and an sce_sys\param.sfo too, so the update folder is told apart by what
 // the base game has and it does not (game000.dat) and by its version (01.28 in param.sfo).
 void CheckFolders() {
+  // A dump that already is version 1.28 in one folder (game000.dat next to the 1.28 eboot.bin) serves as
+  // both: the update field may stay empty or name the same folder.
+  const std::wstring& b0 = g_folder[1].path;
+  const bool merged = !b0.empty() && Exists(b0 + L"\\game000.dat") && Exists(b0 + L"\\eboot.bin") &&
+                      Exists(b0 + L"\\sce_sys\\param.sfo") &&
+                      FileHas(b0 + L"\\sce_sys\\param.sfo", "CUSA00093") &&
+                      FileHas(b0 + L"\\sce_sys\\param.sfo", "01.28");
+  if (merged && g_folder[0].path.empty()) g_folder[0].path = b0;
   const std::wstring& u = g_folder[0].path;
+  if (merged && u == b0) {
+    g_folder[0].ok = true;
+    g_folder[1].ok = true;
+    return;
+  }
   g_folder[0].ok = !u.empty() && Exists(u + L"\\eboot.bin") && Exists(u + L"\\sce_sys\\param.sfo") &&
                    !Exists(u + L"\\game000.dat") && FileHas(u + L"\\sce_sys\\param.sfo", "CUSA00093") &&
                    FileHas(u + L"\\sce_sys\\param.sfo", "01.28");
@@ -184,7 +198,7 @@ std::wstring FolderProblem(int which) {
   const bool eboot = Exists(p + L"\\eboot.bin"), base = Exists(p + L"\\game000.dat");
   const bool sfo = Exists(p + L"\\sce_sys\\param.sfo");
   if (which == 0) {
-    if (base) return L"This is the base game, not the update. Choose the v1.28 update folder here.";
+    if (base) return L"This folder holds the base game. If your dump is already version 1.28 in this one folder, choose the same folder for both fields. Otherwise choose the v1.28 update folder here.";
     if (!eboot || !sfo) return L"Not the update: no eboot.bin and sce_sys here. If it is a parent folder, open it and choose the folder inside.";
     if (!FileHas(p + L"\\sce_sys\\param.sfo", "CUSA00093")) return L"This is another game, not DriveClub (CUSA00093). Choose the DriveClub v1.28 update.";
     return L"This update is not version 1.28 (its sce_sys\\param.sfo has another version). Choose the v1.28 update dump.";
@@ -194,14 +208,25 @@ std::wstring FolderProblem(int which) {
   return L"Not the base game: no game000.dat here. If it is a parent folder, open it and choose the folder inside.";
 }
 
+int lang_saved = 1;   // console language number, from launcher.ini (1 = English, US)
+// The game has a text file for each of these (gui/lams), in console language-number order.
+const wchar_t* const kLangName[21] = {L"Japanese", L"English (US)", L"French", L"Spanish", L"German", L"Italian", L"Dutch",
+                                      L"Portuguese", L"Russian", L"Korean", L"Chinese (Traditional)",
+                                      L"Chinese (Simplified)", L"Finnish", L"Swedish", L"Danish", L"Norwegian",
+                                      L"Polish", L"Portuguese (Brazil)", L"English (UK)", L"Turkish",
+                                      L"Spanish (Mexico)"};
+int g_lang_id = 1;
+int up_saved = 0;     // "Upscaling" choice, from launcher.ini
+int aa_saved = 0;     // "Anti-aliasing" choice, from launcher.ini
+int fgen_saved = 0;   // "Frame generation" choice, from launcher.ini
 int mirror_saved = 0;  // "Mirror and reflection updates" choice, from launcher.ini
 std::wstring g_name = L"Player";  // in-game player name, from "name=" in launcher.ini
-int g_inres = -1, g_wide = -1, g_outres = -1, g_preset = -1, g_mirror = -1, g_fps = -1;
+int g_inres = -1, g_wide = -1, g_outres = -1, g_preset = -1, g_mirror = -1, g_fps = -1, g_fgen = -1, g_aa = -1, g_up = -1, g_lang = -1;
 bool unlocked_saved = false;  // "Unlocked" frame rate choice, from launcher.ini  // indices of the render resolution and widescreen choices
 
 void BuildModel() {
   g_folder[0].label = L"Update folder (version 1.28)";
-  g_folder[0].hint = L"The DriveClub v1.28 update dump: the folder that contains eboot.bin.";
+  g_folder[0].hint = L"The DriveClub v1.28 update dump: the folder that contains eboot.bin. If your dump is already 1.28, leave this empty and choose it below.";
   g_folder[1].label = L"Base game folder";
   g_folder[1].hint = L"The DriveClub base game dump: the folder that contains game000.dat.";
   auto seg = [](const wchar_t* label, const wchar_t* hint, std::vector<std::wstring> items,
@@ -248,7 +273,7 @@ void BuildModel() {
   const int fov = toggle(L"Widescreen field-of-view fix", L"For wide and ultrawide resolutions only.",
                          "FOV fix for wide resolutions", false);
   const int blur = toggle(L"Disable motion blur and depth of field",
-                          L"They share one shader, so both are turned off together.",
+                          L"They share one shader, so both are turned off together. Leave this off when you use FSR or DLAA anti-aliasing: they need the game's blur pass.",
                           "Disable motion blur and depth of field", false);
   const int reset = toggle(L"No reset-to-track timer", L"Disables the reset to track timer.", "Reset Disable", false);
   const int barrier = toggle(L"Disable track barriers", L"Removes the invisible barriers at the track edges.",
@@ -258,11 +283,21 @@ void BuildModel() {
                           "Disable Photomode Free Camera Collision", false);
   const int pproc = toggle(L"Photo mode: skip processing", L"Disables photo mode processing.",
                            "Disable Photomode Processing", false);
+  g_lang = seg(L"Language",
+               L"The language of the game's menus and text. Click to switch to the next one: all 21 languages of the game are available. Japanese, Korean and Chinese may show missing characters.",
+               {L"English (US)"}, {"@lang"}, 0);
   const int pname = seg(L"Player name", L"The name the game shows for you. Click it to type a new one.", {g_name}, {"@name"}, 0);
   g_mirror = seg(L"Mirror and reflection updates",
                  L"The game draws a second small scene (the mirrors, rain and reflections) every frame, about a quarter of all draw calls. "
                  L"Static draws it once and keeps that picture: much faster and steady, but reflections and rain on the glass stop updating.",
                  {L"Live", L"Static (faster)"}, {"@mirror", ""}, 0);
+  g_aa = seg(L"Anti-aliasing",
+             L"Replaces the game's own anti-aliasing with AMD FSR 3.1 (any graphics card) or NVIDIA DLAA (GeForce RTX) for a sharper, steadier picture. The game's own is the default. It does not work together with the patch \"Disable motion blur and depth of field\": the game keeps its own anti-aliasing then.",
+             {L"Game", L"FSR 3.1", L"DLAA (RTX)"}, {"@aa", "", ""}, 0);
+  g_fgen = seg(L"Frame generation (experimental)",
+               L"Adds a made-up frame between each two real ones (FSR 3.1 works on any graphics card; DLSS needs a GeForce RTX 40 series for 2x, RTX 50 series for 3x and 4x), so the picture looks two to four times as smooth. It adds a little delay and can smear fast motion. Best when the game already runs at 45 FPS or more; turn on the Unlocked frame rate as well.",
+               {L"Off", L"FSR 3.1 (2x)", L"DLSS (2x)", L"DLSS (3x)", L"DLSS (4x)"}, {"@fgen", "", "", "", ""}, 0);
+  g_fgen = -1;  // frame generation is not offered in this release
   const int skipgpu = toggle(L"Skip the graphics card check",
                              L"The launcher checks that your graphics card can run the game (Vulkan 1.3). If it refuses a card that does work, turn this on to start anyway.",
                              "@skipgpu", false);
@@ -271,8 +306,11 @@ void BuildModel() {
   const int unlock = toggle(L"Unlock DLC content",
                             L"Unlocks the DLC content: add-on cars, bikes, tours and livery decals. Cars you earn by playing still unlock through normal progression. Built from your own game files; the game folders are not modified.",
                             "@unlock", true);
+  // The cards flow into as many columns as the window width allows (see LayoutPass).
   g_cards.push_back({L"FRAME RATE AND RESOLUTION", {g_preset, fps, outres, inres, wide, fov}, 0});
-  g_cards.push_back({L"GAMEPLAY", {pname, g_mirror, full, unlock, showfps, blur, reset, barrier, pcol, pproc, skipgpu}, 1,
+  g_cards.push_back({L"ANTI-ALIASING", {g_aa}, 0});
+  g_cards.push_back({L"GAMEPLAY", {pname, g_lang, g_mirror, full, unlock, showfps}, 0});
+  g_cards.push_back({L"PATCHES", {blur, reset, barrier, pcol, pproc, skipgpu}, 0,
                      L"Community patches for DriveClub version 1.28."});
 }
 
@@ -302,6 +340,10 @@ void LoadSettings() {
     if (line.rfind("fast=", 0) == 0) fast_render = line.substr(5) == "1";
     if (line.rfind("name=", 0) == 0) g_name = Widen(line.substr(5));
     if (line.rfind("mirror=", 0) == 0) mirror_saved = atoi(line.substr(7).c_str());
+    if (line.rfind("language=", 0) == 0) lang_saved = atoi(line.substr(9).c_str());
+    if (line.rfind("up=", 0) == 0) up_saved = atoi(line.substr(3).c_str());
+    if (line.rfind("aa=", 0) == 0) aa_saved = atoi(line.substr(3).c_str());
+    if (line.rfind("fgen=", 0) == 0) fgen_saved = atoi(line.substr(5).c_str());
     if (line.rfind("unlocked=", 0) == 0) unlocked_saved = line.substr(9) == "1";
     if (line.rfind("skip_gpu_check=", 0) == 0) g_skip_gpu_check = line.substr(15) == "1";
     if (line.rfind("full=", 0) == 0) full_screen = line.substr(5) == "1";
@@ -341,6 +383,13 @@ void LoadSettings() {
   }
   // After the loop above, which resets every row that has no patch of its own.
   if (g_mirror >= 0 && mirror_saved == 1) g_c[g_mirror].sel = mirror_saved;
+  if (g_lang >= 0) {
+    g_lang_id = lang_saved >= 0 && lang_saved <= 20 ? lang_saved : 1;
+    g_c[g_lang].items[0] = kLangName[g_lang_id];
+  }
+  if (g_up >= 0 && up_saved >= 1 && up_saved <= 3) g_c[g_up].sel = up_saved;
+  if (g_aa >= 0 && aa_saved >= 1 && aa_saved <= 2) g_c[g_aa].sel = aa_saved;
+  if (g_fgen >= 0 && fgen_saved >= 1 && fgen_saved <= 4) g_c[g_fgen].sel = fgen_saved;
   if (g_fps >= 0 && unlocked_saved && g_c[g_fps].sel == 1) g_c[g_fps].sel = 3;  // Unlocked is deltatime without the cap
   DerivePreset();
 }
@@ -354,7 +403,28 @@ bool full_screen_now() {
   return true;
 }
 
+// Upscaling: with FSR 3.1 or DLAA chosen, the render size follows from the output size.
+bool UpscaleActive() {
+  return g_up >= 0 && g_aa >= 0 && g_c[g_up].sel > 0 && g_c[g_aa].sel > 0;
+}
+
+void UpscaleSize(int& rw, int& rh, const char*& name) {
+  static const int kOut[7][2] = {{1920, 1080}, {1280, 720}, {2560, 1440}, {3200, 1800}, {3840, 2160}, {5120, 2880}, {7680, 4320}};
+  const int o = g_outres >= 0 ? g_c[g_outres].sel : 0;
+  const int q = g_c[g_up].sel;  // 1 Quality 3/2, 2 Balanced 17/10, 3 Performance 2/1
+  const int num = q == 1 ? 3 : q == 2 ? 17 : 2, den = q == 1 ? 2 : q == 2 ? 10 : 1;
+  rw = ((kOut[o][0] * den / num) + 4) / 8 * 8;
+  rh = ((kOut[o][1] * den / num) + 4) / 8 * 8;
+  name = q == 1 ? "Quality" : q == 2 ? "Balanced" : "Performance";
+}
+
 int MemoryTier() {
+  if (UpscaleActive()) {
+    int rw, rh;
+    const char* name;
+    UpscaleSize(rw, rh, name);
+    return rh <= 1080 ? 0 : rh <= 1440 ? 1 : rh <= 2160 ? 2 : 3;
+  }
   if (g_inres < 0 || g_wide < 0) return 0;
   const int r = g_c[g_inres].sel, w = g_c[g_wide].sel;  // render: Default 720p 1440p 1800p 4K; wide: Off + 3 sizes
   if (r >= 5) return 3;
@@ -383,7 +453,7 @@ void SaveSettings() {
       if (c.kind == Kind::Toggle && c.patches[0] == "@unlock") unlock_on = c.sel != 0;
     }
     ini << "update=" << Narrow(g_folder[0].path) << "\r\nbase=" << Narrow(g_folder[1].path) << "\r\nfps=" << (fps_on ? 1 : 0)
-        << "\r\nfast=" << (fast_on ? 1 : 0) << "\r\nunlocked=" << ((g_fps >= 0 && g_c[g_fps].sel == 3) ? 1 : 0) << "\r\nskip_gpu_check=" << (g_skip_gpu_check ? 1 : 0) << "\r\nmirror=" << (g_mirror >= 0 ? g_c[g_mirror].sel : 0) << "\r\nname=" << Narrow(g_name) <<"\r\nfull=" << (full_on ? 1 : 0) << "\r\nunlock=" << (unlock_on ? 1 : 0) << "\r\n";
+        << "\r\nfast=" << (fast_on ? 1 : 0) << "\r\nunlocked=" << ((g_fps >= 0 && g_c[g_fps].sel == 3) ? 1 : 0) << "\r\nskip_gpu_check=" << (g_skip_gpu_check ? 1 : 0) << "\r\nmirror=" << (g_mirror >= 0 ? g_c[g_mirror].sel : 0) << "\r\nlanguage=" << g_lang_id << "\r\nup=" << (g_up >= 0 ? g_c[g_up].sel : 0) << "\r\naa=" << (g_aa >= 0 ? g_c[g_aa].sel : 0) << "\r\nfgen=" << (g_fgen >= 0 ? g_c[g_fgen].sel : 0) <<"\r\nname=" << Narrow(g_name) <<"\r\nfull=" << (full_on ? 1 : 0) << "\r\nunlock=" << (unlock_on ? 1 : 0) << "\r\n";
     // The renderer optimizations that are switched off, as a bit mask. The draw thread is bit 37.
     const std::wstring toggles = g_data + L"\\user\\toggles.txt";
     std::ofstream tog(toggles.c_str(), std::ios::binary | std::ios::trunc);
@@ -402,7 +472,13 @@ void SaveSettings() {
       out << c.patches[c.sel] << "\n";
     }
   }
-  if (MemoryTier() == 1) out << "Memory for up to 1440p\n";
+  if (UpscaleActive()) {
+    int rw, rh;
+    const char* name;
+    UpscaleSize(rw, rh, name);
+    out << "Upscale render " << rw << "x" << rh << "'+BS+'n";
+  }
+  if (MemoryTier() == 1) out << "Memory for up to 1440p'+BS+'n";
   if (MemoryTier() == 2) out << "Memory for up to 4K\n";
   if (MemoryTier() == 3) out << "Memory for up to 8K\n";
   g_changed = false;
@@ -422,8 +498,11 @@ void ResetDefaults() {
 float RowHeight(const Ctl& c) { return (c.kind == Kind::Toggle ? 46.f : 70.f) + g_row_extra; }
 float FolderRowHeight() { return 74.f; }
 
+int g_cols = 2;  // columns of cards: more when the window is wide
+
 void LayoutPass(float bottom_extra) {
-  const float colw = (g_win_w - 2 * kMargin - kGap) / 2.f;
+  g_cols = (std::clamp)(int((g_win_w - 2 * kMargin + kGap) / (380.f + kGap)), 2, 4);
+  const float colw = (g_win_w - 2 * kMargin - float(g_cols - 1) * kGap) / float(g_cols);
   // game folders: a full-width card on top
   const float folders_h = kTitleH + 2 * FolderRowHeight() + kPad * 0.4f + 8.f;
   const RectF folders_rect(kMargin, kHeaderH, g_win_w - 2 * kMargin, folders_h);
@@ -433,12 +512,32 @@ void LayoutPass(float bottom_extra) {
     f.browse = RectF(f.row.X + f.row.Width - 104.f, fy + 24.f, 104.f, 36.f);
     fy += FolderRowHeight();
   }
-  float y[2] = {kHeaderH + folders_h + kGap, kHeaderH + folders_h + kGap};
-  for (auto& card : g_cards) {
+  float y[4];
+  for (float& v : y) v = kHeaderH + folders_h + kGap;
+  // Card heights; the tallest cards are placed first, each into the shortest column.
+  std::vector<float> heights(g_cards.size());
+  std::vector<size_t> order(g_cards.size());
+  for (size_t k = 0; k < g_cards.size(); ++k) {
     float h = kTitleH + kPad * 0.4f;
-    for (int i : card.ctls) h += RowHeight(g_c[i]);
+    for (int i : g_cards[k].ctls) h += RowHeight(g_c[i]);
     h += kPad * 0.6f;
-    if (card.note) h += 46.f;
+    if (g_cards[k].note) h += 46.f;
+    heights[k] = h;
+    order[k] = k;
+  }
+  std::sort(order.begin(), order.end(), [&](size_t a, size_t b) { return heights[a] > heights[b]; });
+  float fill[4] = {0, 0, 0, 0};
+  for (size_t k : order) {
+    int col = 0;
+    for (int c = 1; c < g_cols; ++c) {
+      if (fill[c] < fill[col] - 1.f) col = c;
+    }
+    g_cards[k].column = col;
+    fill[col] += heights[k] + kGap;
+  }
+  for (size_t k = 0; k < g_cards.size(); ++k) {
+    auto& card = g_cards[k];
+    const float h = heights[k];
     card.rect = RectF(kMargin + card.column * (colw + kGap), y[card.column], colw, h);
     float cy = y[card.column] + kTitleH + kPad * 0.4f;
     for (int i : card.ctls) {
@@ -451,8 +550,10 @@ void LayoutPass(float bottom_extra) {
     }
     y[card.column] += h + kGap;
   }
-  const float bottom = (std::max)(y[0], y[1]) - kGap + bottom_extra;
-  for (int col = 0; col < 2; ++col) {
+  float bottom_y = y[0];
+  for (int col = 1; col < g_cols; ++col) bottom_y = (std::max)(bottom_y, y[col]);
+  const float bottom = bottom_y - kGap + bottom_extra;
+  for (int col = 0; col < g_cols; ++col) {
     for (int k = int(g_cards.size()) - 1; k >= 0; --k) {
       if (g_cards[k].column != col) continue;
       g_cards[k].rect.Height += bottom - (y[col] - kGap);
@@ -479,7 +580,7 @@ void Layout() {
   const float extra = g_win_h - g_natural_h;
   if (extra > 1.f) {
     int rows = 1;
-    for (int col = 0; col < 2; ++col) {
+    for (int col = 0; col < g_cols; ++col) {
       int n = 0;
       for (const auto& card : g_cards) if (card.column == col) n += int(card.ctls.size());
       rows = (std::max)(rows, n);
@@ -789,6 +890,23 @@ std::wstring StartGame() {
     const bool unlocked = g_fps >= 0 && g_c[g_fps].sel == 3;
     SetEnvironmentVariableW(L"BB_FPS_LIMIT", unlocked ? L"1000" : delta ? L"60" : nullptr);
   }
+  if (g_lang >= 0 && GetEnvironmentVariableW(L"BB_LANGUAGE", nullptr, 0) == 0) {
+    SetEnvironmentVariableW(L"BB_LANGUAGE", std::to_wstring(g_lang_id).c_str());
+  }
+  if (g_up >= 0 && GetEnvironmentVariableW(L"BB_AA_SCALE", nullptr, 0) == 0) {
+    const int u = UpscaleActive() ? g_c[g_up].sel : 0;
+    SetEnvironmentVariableW(L"BB_AA_SCALE", u == 0 ? L"native" : u == 1 ? L"quality" : u == 2 ? L"balanced" : L"performance");
+  }
+  if (g_aa >= 0 && GetEnvironmentVariableW(L"BB_AA", nullptr, 0) == 0) {
+    const int a = g_c[g_aa].sel;
+    SetEnvironmentVariableW(L"BB_AA", a == 0 ? L"off" : a == 1 ? L"fsr3" : L"dlss");
+  }
+  if (g_fgen < 0 && GetEnvironmentVariableW(L"BB_FRAME_GEN", nullptr, 0) == 0) SetEnvironmentVariableW(L"BB_FRAME_GEN", L"off");
+  if (g_fgen >= 0 && GetEnvironmentVariableW(L"BB_FRAME_GEN", nullptr, 0) == 0) {
+    const int f = g_c[g_fgen].sel;
+    SetEnvironmentVariableW(L"BB_FRAME_GEN", f == 0 ? L"off" : f == 1 ? L"fsr3" : L"dlss");
+    if (f >= 2) SetEnvironmentVariableW(L"BB_FRAME_GEN_MULTIPLIER", f == 2 ? L"2" : f == 3 ? L"3" : L"4");
+  }
   if (g_mirror >= 0) {
     SetEnvironmentVariableW(L"BB_MIRROR_RATE", g_c[g_mirror].sel == 1 ? L"0" : L"1");
     // Diagnostics only: DRIVECLUB_MIRROR_RATE=<n> overrides the choice above (0: the scene is drawn once and then kept).
@@ -942,10 +1060,22 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_SIZE: {
       // The layout keeps its scale and reflows: wider windows get wider columns, taller ones more room.
       if (w == SIZE_MINIMIZED || g_scale <= 0.f) return 0;
-      g_win_w = (std::max)(kWinW, (std::min)(kMaxW, float(LOWORD(l)) / g_scale));
-      g_win_h = float(HIWORD(l)) / g_scale;
       g_client_h = float(HIWORD(l));
-      Layout();
+      {
+        // Everything shrinks to fit a window that is too short (more columns open up as it does),
+        // down to 60%; below that the content scrolls.
+        const float cw = float(LOWORD(l));
+        float s = g_dpi;
+        for (int i = 0; i < 12; ++i) {
+          g_scale = s;
+          g_win_w = (std::max)(kWinW, (std::min)(kMaxW, cw / s));
+          g_win_h = g_client_h / s;
+          Layout();
+          const float need = TotalHeight() * s;
+          if (need <= g_client_h + 0.5f || s <= g_dpi * 0.6f + 0.001f) break;
+          s = (std::max)(g_dpi * 0.6f, s * g_client_h / need);
+        }
+      }
       g_scroll = (std::min)(g_scroll, MaxScroll());
       g_oy = ContentOy();
       InvalidateRect(h, nullptr, FALSE);
@@ -957,14 +1087,14 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
       GetClientRect(h, &cr);
       const int ncw = (wr.right - wr.left) - cr.right, nch = (wr.bottom - wr.top) - cr.bottom;
       auto* mm = reinterpret_cast<MINMAXINFO*>(l);
-      mm->ptMinTrackSize.x = LONG(kWinW * g_scale) + ncw;
-      mm->ptMinTrackSize.y = LONG((kHeaderH + kFooterH + 160.f) * g_scale) + nch;  // shorter: the content scrolls
-      mm->ptMaxTrackSize.x = LONG(kMaxW * g_scale) + ncw;
+      mm->ptMinTrackSize.x = LONG(kWinW * g_dpi * 0.6f) + ncw;
+      mm->ptMinTrackSize.y = LONG((kHeaderH + kFooterH + 160.f) * g_dpi * 0.6f) + nch;  // shorter: the content scrolls
+      mm->ptMaxTrackSize.x = LONG(kMaxW * g_dpi) + ncw;
       return 0;
     }
     case WM_DPICHANGED: {
       // Moved to a screen with another scale: take the size Windows suggests and draw at that scale.
-      g_scale = float(HIWORD(w)) / 96.f;
+      g_dpi = g_scale = float(HIWORD(w)) / 96.f;
       const RECT* r = reinterpret_cast<const RECT*>(l);
       SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
       InvalidateRect(h, nullptr, FALSE);
@@ -1035,6 +1165,13 @@ LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         Ctl& ctl = g_c[c];
         if (ctl.patches[0] == "@name") {
           StartNameEdit(h, ctl);
+          return 0;
+        }
+        if (ctl.patches[0] == "@lang") {
+          g_lang_id = (g_lang_id + 1) % 21;
+          ctl.items[0] = kLangName[g_lang_id];
+          g_changed = true;
+          InvalidateRect(h, nullptr, FALSE);
           return 0;
         }
         if (ctl.kind == Kind::Toggle) {
@@ -1152,10 +1289,11 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
     for (int i = 1; argv && i + 1 < argc; ++i) {
       if (wcscmp(argv[i], L"--snapshot") != 0) continue;
       HDC screen = GetDC(nullptr);
-      g_scale = float(GetDeviceCaps(screen, LOGPIXELSX)) / 96.f;
+      g_dpi = g_scale = float(GetDeviceCaps(screen, LOGPIXELSX)) / 96.f;
       ReleaseDC(nullptr, screen);
+      if (const char* sw = std::getenv("LAUNCHER_SNAPSHOT_W")) g_win_w = float(std::atoi(sw));
       Layout();
-      const int w = int(kWinW * g_scale), h = int(TotalHeight() * g_scale);
+      const int w = int(g_win_w * g_scale), h = int(TotalHeight() * g_scale);
       {
       Bitmap bmp(w, h, PixelFormat32bppARGB);
       {
@@ -1187,21 +1325,46 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   RegisterClassW(&wc);
 
   HDC screen = GetDC(nullptr);
-  g_scale = float(GetDeviceCaps(screen, LOGPIXELSX)) / 96.f;
+  g_dpi = g_scale = float(GetDeviceCaps(screen, LOGPIXELSX)) / 96.f;
   ReleaseDC(nullptr, screen);
+  // The first window: the narrowest that shows the whole layout on this screen; wider windows hold
+  // more columns and so are shorter. If none fits, the widest and the content scrolls.
+  float start_w = kWinW;
+  {
+    RECT work{};
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) {
+      const float avail_w = float(work.right - work.left), avail_h = float(work.bottom - work.top);
+      const float candidates[3] = {kWinW, 1320.f, kMaxW};
+      for (float cw : candidates) {
+        if (cw * g_scale > avail_w) break;
+        g_win_w = cw;
+        g_win_h = 0;
+        Layout();
+        start_w = cw;
+        if (TotalHeight() * g_scale + 48.f * g_scale <= avail_h) break;
+      }
+    }
+  }
+  g_win_w = start_w;
   Layout();
   const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME;  // every edge and corner resizes
-  RECT rc{0, 0, LONG(kWinW * g_scale), LONG(TotalHeight() * g_scale)};
+  RECT rc{0, 0, LONG(start_w * g_scale), LONG(TotalHeight() * g_scale)};
   AdjustWindowRect(&rc, style, FALSE);
   {
-    // On a screen too short for the whole layout (1440p at 150%), start as tall as the screen allows.
+    // At most 85% of the work area high and 95% wide; the layout then shrinks to fit (see WM_SIZE).
     RECT work{};
-    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0) && rc.bottom - rc.top > work.bottom - work.top)
-      rc.bottom = rc.top + (work.bottom - work.top);
+    if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &work, 0)) {
+      const LONG max_h = LONG((work.bottom - work.top) * 0.85), max_w = LONG((work.right - work.left) * 0.95);
+      if (rc.bottom - rc.top > max_h) rc.bottom = rc.top + max_h;
+      if (rc.right - rc.left > max_w) rc.right = rc.left + max_w;
+    }
   }
-  g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"DriveClub - PC", style,
-                           (GetSystemMetrics(SM_CXSCREEN) - (rc.right - rc.left)) / 2,
-                           (GetSystemMetrics(SM_CYSCREEN) - (rc.bottom - rc.top)) / 2, rc.right - rc.left,
+  // Centred in the work area (the screen without the taskbar), never above its top edge.
+  RECT area{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+  SystemParametersInfoW(SPI_GETWORKAREA, 0, &area, 0);
+  const int win_x = (std::max)(int(area.left), int(area.left) + (int(area.right - area.left) - int(rc.right - rc.left)) / 2);
+  const int win_y = (std::max)(int(area.top), int(area.top) + (int(area.bottom - area.top) - int(rc.bottom - rc.top)) / 2);
+  g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"DriveClub - PC", style, win_x, win_y, rc.right - rc.left,
                            rc.bottom - rc.top, nullptr, nullptr, inst, nullptr);
   ShowWindow(g_hwnd, show);
   MSG msg;

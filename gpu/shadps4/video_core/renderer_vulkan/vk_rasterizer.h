@@ -9,6 +9,7 @@
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_bind_helper.h"
 #include "video_core/renderer_vulkan/vk_camera_motion.h"
+#include "video_core/renderer_vulkan/vk_drive_aa.h"
 #include "video_core/renderer_vulkan/vk_constant_ring.h"
 #include "video_core/renderer_vulkan/vk_scene_resolution.h"
 #include "video_core/renderer_vulkan/vk_object_motion.h"
@@ -328,6 +329,7 @@ private:
     Common::SharedFirstMutex mapped_ranges_mutex;
     PipelineCache pipeline_cache;
     std::unique_ptr<DrawPreparation> draw_prep;
+    std::unique_ptr<DriveAA> drive_aa;
     std::unique_ptr<CameraMotion> camera_motion; // bbport: motion vectors (docs/upscaler.md)
     std::unique_ptr<SceneTargets> scene_targets;
     bool scene_started = false;
@@ -335,6 +337,13 @@ private:
     bool motion_draw = false;
     u64 motion_geometry{};    ///< vertex-stream identity of the current direct draw
     bool gbuffer_draw = false;
+    /// Frame generation: the scene depth (the G-buffer pass), the first draw into the display buffer
+    /// since other work (the UI starts: the picture before it is the HUD-less frame).
+    VideoCore::ImageId fg_depth{};
+    u64 fg_depth_area = 0;
+    bool fg_in_display = false;
+    u32 fg_display_draws = 0; ///< draws into the display buffer since other work
+    bool fg_capture_pending = false;
     /// A compute pass writes one of the mirror scene's targets while that scene is skipped: it would filter
     /// an already filtered picture again, so the dispatch is dropped as well.
     bool skip_mirror_dispatch = false;

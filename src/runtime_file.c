@@ -91,6 +91,18 @@ void runtime_file_configure(const char *app0,const char *user) {
         runtime_file_mount(guest,path);
     }
 }
+/* A game file that does not exist is looked for again and again: each path is logged once. */
+static void log_missing(const char *guest) {
+    static unsigned long long seen[512]; static int count, busy;
+    unsigned long long h=1469598103934665603ULL;
+    for (const char *p=guest; *p; ++p) h=(h^(unsigned char)*p)*1099511628211ULL;
+    while (__sync_lock_test_and_set(&busy,1)) {}
+    int known=0;
+    for (int i=0;i<count;++i) if (seen[i]==h) { known=1; break; }
+    if (!known && count<512) seen[count++]=h;
+    __sync_lock_release(&busy);
+    if (!known) printf("Runtime: open(%s) -> not found\n",guest);
+}
 static char app0_base[600];
 void runtime_file_set_base(const char *dir) { snprintf(app0_base,sizeof(app0_base),"%s",dir ? dir : ""); }
 /* Files the player puts in this folder replace the game's own files of the same path (read only). */
@@ -241,13 +253,13 @@ static int64_t do_open(const char *guest,int flags,int mode) {
         if (!(dir=list_directory(path))) return -EACCES;
     } else if (flags&0x20000) {
         e=errno==ENOENT ? ENOENT : ENOTDIR;
-        if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
+        if (e==ENOENT) { ++missing; log_missing(guest); }
         return -e;
     } else {
         host=open(path,host_flags(flags)&~O_DIRECTORY,_S_IREAD|_S_IWRITE);
         if (host<0) {
             e=errno;
-            if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
+            if (e==ENOENT) { ++missing; log_missing(guest); }
             return -e;
         }
         if (host_fstat(host,&s)) memset(&s,0,sizeof(s));
@@ -256,7 +268,7 @@ static int64_t do_open(const char *guest,int flags,int mode) {
     int host=open(path,host_flags(flags),mode ? mode : 0644);
     if (host<0) {
         e=errno;
-        if (e==ENOENT) { ++missing; printf("Runtime: open(%s) -> not found\n",guest); }
+        if (e==ENOENT) { ++missing; log_missing(guest); }
         return -e;
     }
     struct stat s;

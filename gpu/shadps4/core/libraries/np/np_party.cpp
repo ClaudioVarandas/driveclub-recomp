@@ -5,138 +5,147 @@
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/np/np_error.h"
+#include <atomic>
 #include "core/libraries/np/np_party.h"
 
 namespace Libraries::Np::NpParty {
 
+// The game polls these stubs all the time: only the first few calls are logged.
+static void NpPartyStubLog() {
+    static std::atomic<u32> calls{0};
+    if (calls.fetch_add(1) < 3) {
+        LOG_ERROR(Lib_NpParty, "(STUBBED) called (later calls are not logged)");
+    }
+}
+
 s32 PS4_SYSV_ABI sceNpPartyCheckCallback() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyCreate() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyCreateA() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyGetId() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyGetMemberInfo() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_NP_PARTY_ERROR_NOT_IN_PARTY;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyGetMemberInfoA() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_NP_PARTY_ERROR_NOT_IN_PARTY;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyGetMembers() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_NP_PARTY_ERROR_NOT_IN_PARTY;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyGetMembersA() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_NP_PARTY_ERROR_NOT_IN_PARTY;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyGetMemberSessionInfo() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyGetMemberVoiceInfo() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyGetState(OrbisNpPartyState* state) {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     *state = OrbisNpPartyState::NotInParty;
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyGetStateAsUser() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyGetStateAsUserA() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyGetVoiceChatPriority() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyInitialize() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyJoin() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyLeave() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyRegisterHandler() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyRegisterHandlerA() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyRegisterPrivateHandler() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartySendBinaryMessage() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartySetVoiceChatPriority() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyShowInvitationList() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyShowInvitationListA() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyTerminate() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 
 s32 PS4_SYSV_ABI sceNpPartyUnregisterPrivateHandler() {
-    LOG_ERROR(Lib_NpParty, "(STUBBED) called");
+    NpPartyStubLog();
     return ORBIS_OK;
 }
 

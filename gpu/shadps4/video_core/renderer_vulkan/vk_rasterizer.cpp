@@ -1,9 +1,13 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <array>
+#include <cstring>
 #include <optional>
+#include <set>
 #include <xxhash.h>
 #include "video_core/renderer_vulkan/ui_composition.h"
+#include "bbport_settings.h"
 #include "bbport_toggles.h"
 #include "video_core/renderer_vulkan/vk_frame_capture.h"
 #include "common/debug.h"
@@ -16,6 +20,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
+#include "video_core/renderer_vulkan/vk_drive_motion.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
@@ -28,6 +33,37 @@
 #include "video_core/texture_cache/texture_cache.h"
 
 namespace Vulkan {
+
+namespace {
+DriveMotion* g_drive_motion = nullptr;
+// The game's anti-aliasing pass carries its camera matrices: frame generation takes its motion
+// vectors from them.
+void NoteTaaBuffer(u64 hash, u32 slot, const void* data, u32 size) {
+    // The anti-aliasing pass has several variants (by resolution): recognise its two constant
+    // buffers by size and content. Slot 0: a 4x4 affine move, then matrices. Slot 1: the
+    // projection at dword 48 (reversed Z, infinite far plane).
+    if (!g_drive_motion || slot > 1 || !data) {
+        return;
+    }
+    std::array<float, 128> f{};
+    if (slot == 0 && size == 416) {
+        std::memcpy(f.data(), data, 104 * sizeof(float));
+        if (f[3] != 0.0f || f[7] != 0.0f || f[11] != 0.0f || f[15] != 1.0f) {
+            return;
+        }
+    } else if (slot == 1 && size == 512) {
+        std::memcpy(f.data(), data, 128 * sizeof(float));
+        if (!(f[48] > 0.1f && f[48 + 5] > 0.1f && f[48 + 11] == -1.0f && f[48 + 14] > 0.0f &&
+              f[48 + 14] < 1.0f)) {
+            return;
+        }
+    } else {
+        return;
+    }
+    g_drive_motion->OnTaaConstants(slot, f.data(), size / 4);
+}
+} // namespace
+
 
 static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     // TODO(roamic): Add support for multiple viewports and geometry shaders when ViewportIndex
@@ -58,6 +94,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     camera_motion->SetObjectMotion(object_motion.get());
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
                                                   *camera_motion, *scene_targets);
+    g_drive_motion = &upscaler->GetDriveMotion();
+    drive_aa = std::make_unique<DriveAA>(instance, scheduler, texture_cache, runtime,
+                                         upscaler->GetDriveMotion());
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -268,6 +307,17 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     gbuffer_draw = camera_motion->Enabled() && std::popcount(key.mrt_mask) >= 5 && db_desc.first;
     if (gbuffer_draw) {
         camera_motion->OnGBufferPass(db_desc.first);
+    }
+    // Frame generation: the G-buffer pass (three color targets and a depth target) holds the scene depth.
+    if ((BbSettings::Get().frame_gen != BbSettings::FrameGenOff || drive_aa->Active()) &&
+        std::popcount(key.mrt_mask) == 3 &&
+        db_desc.first && cb_descs[0].first) {
+        // The biggest one of the frame: the mirror and reflection probe scenes use the same layout.
+        const auto& size = texture_cache.GetImage(db_desc.first).info.size;
+        if (u64(size.width) * size.height >= fg_depth_area) {
+            fg_depth = db_desc.first;
+            fg_depth_area = u64(size.width) * size.height;
+        }
     }
     if (upscaler->Enabled() && cb_descs[0].first) {
         upscaler->OnColorTarget(cb_descs[0].first);
@@ -1062,9 +1112,26 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const auto& regs = Regs();
     // bbport: the pass copying a finished frame to a display buffer; the previous draw's
     // target is that frame.
-    if (regs.color_buffers[0] && FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address())) {
+    const bool display_draw =
+        regs.color_buffers[0] && FrameCapture::IsDisplayBuffer(regs.color_buffers[0].Address());
+    if (display_draw) {
+        // Frame generation: the first display draw is the game's scene composite; the picture
+        // before the UI is the display buffer once it is done, at the start of the second.
+        if (!fg_in_display) {
+            fg_display_draws = 0;
+        }
+        ++fg_display_draws;
+        if (fg_display_draws == 2 && BbSettings::Get().frame_gen != BbSettings::FrameGenOff) {
+            fg_capture_pending = true;
+        }
+        fg_in_display = true;
+    } else {
+        fg_in_display = false;
+    }
+    if (display_draw) {
         // The frame counter also drives the mirror update rate: it must not depend on the upscaler.
         NoteFrameStart();
+        drive_aa->NextFrame();
         if (camera_motion->Enabled()) {
             scene_started = false;
             camera_motion->OnDisplayPass(cb_descs[0].first);
@@ -1112,6 +1179,16 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     phase.emplace(BbStats::phase_ns[4]);
     const auto state = BeginRendering(pipeline);
     phase.emplace(BbStats::phase_ns[5]);
+    if (fg_capture_pending) {
+        fg_capture_pending = false;
+        if (fg_depth) {
+            const u64 display_address = regs.color_buffers[0].Address();
+            upscaler->CaptureFrameGen(fg_depth, display_address);
+            upscaler->CaptureHudless(cb_descs[0].first, display_address);
+        }
+        fg_depth = {};
+        fg_depth_area = 0;
+    }
 
     if (!inputs_resolved) {
         ResolveVertexBuffers(pipeline, draw_prepared);
@@ -1222,6 +1299,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth() &&
         (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
         draw_jitter = upscaler->Jitter();
+    } else if (drive_aa->Active() && db_desc.first && db_desc.first == fg_depth &&
+               (regs.num_indices > 6 || regs.num_instances.NumInstances() > 1)) {
+        draw_jitter = drive_aa->Jitter();
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
@@ -1392,6 +1472,8 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     draw_jitter = {};
     if (upscaler->Enabled() && db_desc.first && db_desc.first == camera_motion->Depth()) {
         draw_jitter = upscaler->Jitter();
+    } else if (drive_aa->Active() && db_desc.first && db_desc.first == fg_depth) {
+        draw_jitter = drive_aa->Jitter();
     }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
@@ -1445,6 +1527,7 @@ void Rasterizer::DispatchDirect() {
 }
 
 void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
+    fg_in_display = false;
     FrameCapture::Poll();
     gbuffer_draw = false;
     skip_mirror_dispatch = false;
@@ -1554,6 +1637,24 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         cmdbuf.dispatch(dim_x, dim_y, dim_z);
     });
     DebugState.IncDispatch();
+
+    // The game's temporal anti-aliasing pass: FSR or DLSS replaces its result.
+    if (drive_aa->Active() && fg_depth) {
+        const auto format = [&](u32 i) {
+            return texture_cache.GetImage(bound_images[i]).info.pixel_format;
+        };
+        constexpr auto hdr = vk::Format::eB10G11R11UfloatPack32;
+        if (bound_images.size() == 6 && cs.images.size() == 6 && format(0) == hdr &&
+            format(1) == vk::Format::eR8G8B8A8Unorm && format(2) == vk::Format::eR32Sfloat &&
+            format(5) == vk::Format::eR32Sfloat) {
+            // The anti-aliasing pass: the lit picture, the G-buffer, the linear depth and the
+            // history of both; it writes one of the two HDR images after the first.
+            const u32 out = cs.images[3].is_written ? 3 : cs.images[4].is_written ? 4 : 0;
+            if (out && format(out) == hdr) {
+                drive_aa->OnTaa(bound_images[0], fg_depth, bound_images[out]);
+            }
+        }
+    }
 
     ResetBindings(true);
     scheduler.KickRecording();
@@ -1770,6 +1871,11 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
             reported = sampler_lod_bias;
             std::printf("Upscaler: scene texture LOD bias %.2f\n", sampler_lod_bias);
         }
+    } else if (!pipeline->IsCompute() && drive_aa->Upscaling() &&
+               std::popcount(static_cast<const GraphicsPipeline*>(pipeline)->GetGraphicsKey().mrt_mask &
+                             0xff) == 3) {
+        // The G-buffer passes: material textures at the output size's detail.
+        sampler_lod_bias = drive_aa->MipBias();
     }
 
     bool uses_dma = false;
@@ -2262,6 +2368,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
                     memory->IsValidGpuMapping(ring->address, 0)) {
                     camera_motion->OnConstants(reinterpret_cast<const float*>(ring->address));
                 }
+                if (memory->IsValidGpuMapping(ring->address, 0)) NoteTaaBuffer(stage.pgm_hash, buffer_index, reinterpret_cast<const void*>(ring->address), ring->size);
                 push_data.AddOffset(binding.buffer, 0);
             }
             buffer_infos.emplace_back(constant_ring->Handle(), ring->offset, ring->size);
@@ -2273,10 +2380,6 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
             } else if (desc.buffer_type == Shader::BufferType::Flatbuf) {
                 auto& vk_buffer = buffer_cache.GetStreamBuffer();
                 const u32 ubo_size = stage.FlatUserData().size() * sizeof(u32);
-                if (FrameCapture::Active()) {
-                    FrameCapture::Buffer(stage.pgm_hash, binding.buffer, 0,
-                                         stage.FlatUserData().data(), ubo_size);
-                }
                 const u64 offset =
                     vk_buffer.Copy(stage.FlatUserData().data(), ubo_size, alignment);
                 buffer_infos.emplace_back(vk_buffer.Handle(), offset, ubo_size);
@@ -2319,6 +2422,7 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, const PreparedStage* pre
         } else {
             const auto vsharp =
                 prepared ? prepared->buffer_sharps[buffer_index] : desc.GetSharp(stage);
+            if (vsharp.base_address != 0 && memory->IsValidGpuMapping(vsharp.base_address, 0)) NoteTaaBuffer(stage.pgm_hash, buffer_index, reinterpret_cast<const void*>(vsharp.base_address), vsharp.GetSize());
             if (vsharp.GetSize() == 864 && gbuffer_draw &&
                 memory->IsValidGpuMapping(vsharp.base_address, 0)) {
                 camera_motion->OnConstants(reinterpret_cast<const float*>(vsharp.base_address));
@@ -2454,6 +2558,9 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
     boost::container::small_vector<bool, 16> binding_proxy_ok;
     const bool sample_proxies = !BbToggle::Disabled(BbToggle::SampleSceneProxies) &&
                                 !on_helper && scene_targets->Reduced();
+    // Upscaling: the game's anti-aliased picture is replaced by the upscaled one where it is
+    // sampled by UV.
+    const bool drive_redirect = !on_helper && drive_aa->Upscaling();
 
     for (u32 image_index = 0; image_index < stage.images.size(); ++image_index) {
         const auto& image_desc = stage.images[image_index];
@@ -2495,7 +2602,7 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
             mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex
                 ? static_cast<u32>(tsharp.last_level - tsharp.base_level + 1)
                 : 1u;
-        const bool proxy_candidate = sample_proxies && num_bindings == 1 &&
+        const bool proxy_candidate = (sample_proxies || drive_redirect) && num_bindings == 1 &&
                                      !image_desc.needs_native && !image_desc.is_written &&
                                      mip_fallback_mode == Shader::MipStorageFallbackMode::None;
 
@@ -2625,6 +2732,16 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
                 image_id, desc, memo_entry ? &memo_entry->view_memo : nullptr, !on_helper);
             const auto binding = image.binding;
 
+            if (drive_redirect && binding_proxy_ok[binding_index] && !is_storage &&
+                !binding.force_general && !binding.is_target && drive_aa->Redirects(image_id)) {
+                vk::ImageView redirected;
+                vk::ImageLayout redirected_layout;
+                drive_aa->Redirect(redirected, redirected_layout);
+                image.usage.texture = 1u;
+                image_infos.emplace_back(VK_NULL_HANDLE, redirected, redirected_layout);
+                set_ok = false;
+                continue;
+            }
             // bbport: a proxied scene image sampled with normalized coordinates reads the proxy:
             // no resample to the native size (the native image is not touched).
             if (binding_proxy_ok[binding_index] && !is_storage && !binding.force_general &&

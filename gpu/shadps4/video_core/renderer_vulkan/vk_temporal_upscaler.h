@@ -38,8 +38,20 @@ class Runtime;
 class CameraMotion;
 class SceneTargets;
 
+class FrameGenerator;
+class DriveMotion;
+
 class TemporalUpscaler {
 public:
+    DriveMotion& GetDriveMotion() noexcept { return *drive_motion; }
+    void SetFrameGenerator(FrameGenerator* generator) noexcept {
+        frame_generator = generator;
+    }
+    /// Frame generation: the scene depth and (still) motion of this frame, taken before the game's UI.
+    void CaptureFrameGen(VideoCore::ImageId depth_id, u64 address);
+    /// Frame generation: the picture before the game's UI (the display buffer, before the UI draws).
+    void CaptureHudless(VideoCore::ImageId color, u64 address);
+
     TemporalUpscaler(const Instance& instance, Scheduler& scheduler,
                      VideoCore::TextureCache& texture_cache, Runtime& runtime,
                      CameraMotion& camera_motion, SceneTargets& scene_targets);
@@ -180,6 +192,8 @@ private:
     void ExtraSharpen(vk::CommandBuffer cmdbuf, vk::Image target, bool ldr, u32 w, u32 h);
 
     const Instance& instance;
+    FrameGenerator* frame_generator = nullptr;
+    std::unique_ptr<DriveMotion> drive_motion;
     Scheduler& scheduler;
     VideoCore::TextureCache& texture_cache;
     Runtime& runtime;

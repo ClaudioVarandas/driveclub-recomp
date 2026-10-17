@@ -275,13 +275,14 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested_info, Bindi
         const auto new_image_id = slot_images.insert(instance, runtime, slot_image_views, new_info);
         RegisterImage(new_image_id);
 
-        // Inherit image usage
+        // Inherit image usage (the insert may have moved the storage: take both images again)
         auto& new_image = slot_images[new_image_id];
-        new_image.usage = cache_image.usage;
+        auto& old_image = slot_images[cache_image_id];
+        new_image.usage = old_image.usage;
         new_image.flags &= ~ImageFlagBits::Dirty;
         // When creating a depth buffer through overlap resolution don't clear it on first use.
         new_image.info.meta_info.htile_clear_mask = 0;
-        runtime.CopyColorAndDepth(&cache_image, &new_image);
+        runtime.CopyColorAndDepth(&old_image, &new_image);
 
         // Free the cache image.
         FreeImage(cache_image_id);
@@ -522,7 +523,9 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
     return {merged_image_id, -1, -1};
 }
 
-ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
+ImageId TextureCache::ExpandImage(const ImageInfo& info_ref, ImageId image_id) {
+    // `info_ref` may live inside a slot image: inserting can move the storage, so work on a copy.
+    const ImageInfo info = info_ref;
     BbStats::image_creates[1].fetch_add(1, std::memory_order_relaxed);
     if (info.size.width == 768 && info.size.height == 512) {
         BbStats::mirror_img_created[1].fetch_add(1, std::memory_order_relaxed);
@@ -626,7 +629,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_fmt) {
             view_mip = -1;
             view_slice = -1;
 
-            const auto& merged_info = image_id ? slot_images[image_id].info : info;
+            // A copy: the overlap handling can add images, which moves the slot storage.
+            const ImageInfo merged_info = image_id ? slot_images[image_id].info : info;
             auto [overlap_image_id, overlap_view_mip, overlap_view_slice] =
                 ResolveOverlap(merged_info, desc.type, cache_id, image_id);
             if (overlap_image_id) {

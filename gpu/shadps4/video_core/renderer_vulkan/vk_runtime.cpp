@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
 #include <set>
 #include <ctime>
 #include <boost/container/small_vector.hpp>
@@ -537,7 +538,10 @@ void Runtime::CopyColorAndDepth(VideoCore::Image* src, VideoCore::Image* dst) {
             dst->info.size.width, dst->info.size.height, dst->info.num_samples,
             src->info.pixel_format, dst->info.pixel_format, src->GetImage(), dst->GetImage());
     } else {
-        LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy");
+        static std::atomic<u32> warned{0};
+        if (warned.fetch_add(1) < 3) {  // it repeats many times a second: only the first few are logged
+            LOG_WARNING(Render_Vulkan, "Unimplemented depth overlap copy (later ones are not logged)");
+        }
     }
 }
 

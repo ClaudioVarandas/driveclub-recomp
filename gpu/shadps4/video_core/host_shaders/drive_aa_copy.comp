@@ -1,0 +1,21 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// The anti-aliased picture (RGBA16F) into the image the game's anti-aliasing pass wrote (R11G11B10F).
+#version 450
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0, rgba16f) uniform readonly image2D src_img;
+layout(binding = 1, r11f_g11f_b10f) uniform writeonly image2D dst_img;
+
+layout(push_constant) uniform Constants {
+    vec2 size;
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    const vec3 c = max(imageLoad(src_img, pixel).rgb, vec3(0.0));
+    imageStore(dst_img, pixel, vec4(c, 1.0));
+}

@@ -1,0 +1,195 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+#include "video_core/renderer_vulkan/vk_drive_motion.h"
+
+#include <cmath>
+#include <cstring>
+
+#include "video_core/host_shaders/drive_motion_comp.h"
+#include "video_core/renderer_vulkan/vk_instance.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
+
+namespace Vulkan {
+
+namespace {
+
+using Mat = std::array<float, 16>;
+
+constexpr Mat Identity = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+
+struct Push {
+    std::array<float, 2> src_size;
+    std::array<float, 2> pad; // the matrix starts on 16 bytes in the shader
+    Mat clip_to_prev_clip;
+    std::array<float, 2> size;
+    std::array<float, 2> scale;
+};
+
+Mat Multiply(const Mat& a, const Mat& b) {
+    Mat out{};
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            float v = 0.0f;
+            for (int k = 0; k < 4; ++k) {
+                v += a[r * 4 + k] * b[k * 4 + c];
+            }
+            out[r * 4 + c] = v;
+        }
+    }
+    return out;
+}
+
+/// General 4x4 inverse by Gauss-Jordan in doubles. Returns false for a singular matrix.
+bool Invert(const Mat& m, Mat& out) {
+    double a[4][8];
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            a[r][c] = m[r * 4 + c];
+            a[r][4 + c] = r == c ? 1.0 : 0.0;
+        }
+    }
+    for (int col = 0; col < 4; ++col) {
+        int pivot = col;
+        for (int r = col + 1; r < 4; ++r) {
+            if (std::fabs(a[r][col]) > std::fabs(a[pivot][col])) {
+                pivot = r;
+            }
+        }
+        if (std::fabs(a[pivot][col]) < 1e-30) {
+            return false;
+        }
+        for (int c = 0; c < 8; ++c) {
+            std::swap(a[col][c], a[pivot][c]);
+        }
+        const double scale = 1.0 / a[col][col];
+        for (int c = 0; c < 8; ++c) {
+            a[col][c] *= scale;
+        }
+        for (int r = 0; r < 4; ++r) {
+            if (r == col) {
+                continue;
+            }
+            const double f = a[r][col];
+            for (int c = 0; c < 8; ++c) {
+                a[r][c] -= f * a[col][c];
+            }
+        }
+    }
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            out[r * 4 + c] = float(a[r][4 + c]);
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+DriveMotion::DriveMotion(const Instance& instance) {
+    const auto device = instance.GetDevice();
+    const std::array<vk::DescriptorSetLayoutBinding, 2> bindings = {{
+        {.binding = 0,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        {.binding = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eCompute},
+    }};
+    desc_layout = Check(device.createDescriptorSetLayoutUnique({
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
+    }));
+    const vk::PushConstantRange range{.stageFlags = vk::ShaderStageFlagBits::eCompute,
+                                      .offset = 0,
+                                      .size = sizeof(Push)};
+    pipeline_layout = Check(device.createPipelineLayoutUnique({
+        .setLayoutCount = 1,
+        .pSetLayouts = &*desc_layout,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &range,
+    }));
+    const auto module = CompileSPV(DRIVE_MOTION_COMP, device);
+    pipeline = Check(device.createComputePipelineUnique(
+        {}, vk::ComputePipelineCreateInfo{
+                .stage = {.stage = vk::ShaderStageFlagBits::eCompute,
+                          .module = module,
+                          .pName = "main"},
+                .layout = *pipeline_layout,
+            }));
+    device.destroyShaderModule(module);
+}
+
+void DriveMotion::OnTaaConstants(u32 slot, const float* data, u32 dwords) {
+    // Slot 0, dwords 16..31: the relative camera move current view -> previous view followed by
+    // the projection (the anti-aliasing pass reprojects with it). Slot 1, dwords 48..63: the
+    // projection itself (row vectors, reversed Z, infinite far plane).
+    if (slot == 0 && dwords >= 32) {
+        std::memcpy(relative.data(), data + 16, sizeof(relative));
+        got_slot0 = true;
+    } else if (slot == 1 && dwords >= 64) {
+        std::memcpy(projection.data(), data + 48, sizeof(projection));
+        got_slot1 = true;
+    }
+}
+
+bool DriveMotion::ClipToPrevious(std::array<float, 16>& out) const {
+    Mat inverse{};
+    if (!Invert(projection, inverse)) {
+        out = Identity;
+        return false;
+    }
+    out = Multiply(inverse, relative);
+    return true;
+}
+
+void DriveMotion::Record(vk::CommandBuffer cmdbuf, vk::ImageView depth_view,
+                         vk::ImageView motion_view, u32 width, u32 height, u32 src_width,
+                         u32 src_height, bool normalized) {
+    Push push{};
+    ClipToPrevious(push.clip_to_prev_clip);
+    push.size = {float(width), float(height)};
+    push.src_size = {float(src_width), float(src_height)};
+    // DLSS Frame Generation takes screen fractions (its scale is 1); FSR takes pixels.
+    push.scale = normalized ? std::array<float, 2>{1.0f / float(width), 1.0f / float(height)}
+                            : std::array<float, 2>{1.0f, 1.0f};
+    const vk::DescriptorImageInfo depth_info{.imageView = depth_view,
+                                             .imageLayout = vk::ImageLayout::eGeneral};
+    const vk::DescriptorImageInfo motion_info{.imageView = motion_view,
+                                              .imageLayout = vk::ImageLayout::eGeneral};
+    const std::array<vk::WriteDescriptorSet, 2> writes = {{
+        {.dstBinding = 0,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .pImageInfo = &depth_info},
+        {.dstBinding = 1,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eStorageImage,
+         .pImageInfo = &motion_info},
+    }};
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *pipeline);
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *pipeline_layout, 0, writes);
+    cmdbuf.pushConstants(*pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+                         &push);
+    cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, 1);
+}
+
+void DriveMotion::ClipTransforms(std::array<float, 16>& view_to_clip,
+                                 std::array<float, 16>& clip_to_prev_clip,
+                                 std::array<float, 16>& prev_clip_to_clip) const {
+    view_to_clip = projection;
+    ClipToPrevious(clip_to_prev_clip);
+    Mat inverse{};
+    prev_clip_to_clip = Invert(clip_to_prev_clip, inverse) ? inverse : Identity;
+}
+
+float DriveMotion::Near() const noexcept {
+    return projection[14] > 0.0f ? projection[14] : 0.02f;
+}
+
+float DriveMotion::VerticalFov() const noexcept {
+    return projection[5] > 0.0f ? 2.0f * std::atan(1.0f / projection[5]) : 0.9f;
+}
+
+} // namespace Vulkan

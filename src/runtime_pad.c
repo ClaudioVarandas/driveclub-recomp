@@ -540,7 +540,7 @@ static ABI int32_t pad_open(int32_t user, int32_t type, int32_t index, const voi
     for (int i=0;i<nkeys;++i)
         if (keys[i].user==user && keys[i].type==type && keys[i].index==index) {
             pthread_mutex_unlock(&lock);
-            printf("Runtime: scePadOpen(user %d, type %d, index %d) -> already opened\n",user,type,index);
+            { static int shown; if (shown++ < 3) printf("Runtime: scePadOpen(user %d, type %d, index %d) -> already opened (later ones are not logged)\n",user,type,index); }
             return ERR_ALREADY_OPENED;
         }
     if (nkeys<16) { keys[nkeys].user=user; keys[nkeys].type=type; keys[nkeys].index=index; ++nkeys; }

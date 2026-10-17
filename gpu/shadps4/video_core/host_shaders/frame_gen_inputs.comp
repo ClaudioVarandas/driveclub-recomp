@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// bbport: frame generation's depth input, taken where the upscaler runs (before the game's
+// post-processing): the scene depth as R32F. The motion vectors come from CameraMotion.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D depth_tex; // D32 depth aspect, render size
+layout(binding = 1, r32f) uniform writeonly image2D depth_img;
+
+layout(push_constant) uniform Constants {
+    vec2 src_size; // the game's render size
+    vec2 size;  // output pixels (the frame size the generator works at)
+    float flip; // 1: write 1 - depth (FSR wants 0 at the near plane), 0: keep the game's depth
+};
+
+void main() {
+    const ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    if (pixel.x >= int(size.x) || pixel.y >= int(size.y)) {
+        return;
+    }
+    // DriveClub renders reversed Z (1 near). DLSS takes it as is (with its inverted depth flag) so it
+    // agrees with the game's matrices.
+    const ivec2 src = ivec2(min((vec2(pixel) + 0.5) / size * src_size, src_size - 1.0));
+    const float depth = texelFetch(depth_tex, src, 0).r;
+    imageStore(depth_img, pixel, vec4(flip > 0.5 ? 1.0 - depth : depth, 0.0, 0.0, 0.0));
+}

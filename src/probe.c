@@ -26,6 +26,10 @@
 #include <sys/uio.h>
 #endif
 
+#ifdef _WIN32
+static unsigned long long start_tick; /* GetTickCount64() at start, for the fault report */
+#endif
+
 typedef struct { uint64_t address, size, flags; } Segment;
 typedef struct { uint64_t target, kind, value, addend; } Reloc;
 static char (*names)[128];
@@ -236,6 +240,7 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
                 (void *)record->ExceptionInformation[1],where,GetCurrentThreadId());
     else
         fprintf(stderr,"Fault: exception 0x%08lx at %s (thread %lu)\n",record->ExceptionCode,where,GetCurrentThreadId());
+    fprintf(stderr,"  uptime %llu s\n",(unsigned long long)(GetTickCount64()-start_tick)/1000ULL);
     fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp);
     if (gpu_enabled) bbgpu_dump_guest_writes(info);
@@ -529,6 +534,9 @@ void runtime_restart(void) {
 }
 
 int main(int argc, char **argv) {
+#ifdef _WIN32
+    start_tick=GetTickCount64();
+#endif
     setvbuf(stdout, NULL, _IONBF, 0);
 #ifndef _WIN32
     /* Keep host heap objects handed to the guest (thread handles, TLS) in the
