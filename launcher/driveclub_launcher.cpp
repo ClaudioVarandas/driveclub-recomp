@@ -175,7 +175,7 @@ void CheckFolders() {
   const bool merged = !b0.empty() && Exists(b0 + L"\\game000.dat") && Exists(b0 + L"\\eboot.bin") &&
                       Exists(b0 + L"\\sce_sys\\param.sfo") &&
                       FileHas(b0 + L"\\sce_sys\\param.sfo", "CUSA00093") &&
-                      FileHas(b0 + L"\\sce_sys\\param.sfo", "01.28");
+                      SfoIsVersion128(std::filesystem::path(b0 + L"\\sce_sys\\param.sfo"));
   if (merged && g_folder[0].path.empty()) g_folder[0].path = b0;
   const std::wstring& u = g_folder[0].path;
   if (merged && u == b0) {
@@ -185,7 +185,7 @@ void CheckFolders() {
   }
   g_folder[0].ok = !u.empty() && Exists(u + L"\\eboot.bin") && Exists(u + L"\\sce_sys\\param.sfo") &&
                    !Exists(u + L"\\game000.dat") && FileHas(u + L"\\sce_sys\\param.sfo", "CUSA00093") &&
-                   FileHas(u + L"\\sce_sys\\param.sfo", "01.28");
+                   SfoIsVersion128(std::filesystem::path(u + L"\\sce_sys\\param.sfo"));
   const std::wstring& b = g_folder[1].path;
   g_folder[1].ok = !b.empty() && Exists(b + L"\\game000.dat") && FileHas(b + L"\\sce_sys\\param.sfo", "CUSA00093");
 }
@@ -476,9 +476,9 @@ void SaveSettings() {
     int rw, rh;
     const char* name;
     UpscaleSize(rw, rh, name);
-    out << "Upscale render " << rw << "x" << rh << "'+BS+'n";
+    out << "Upscale render " << rw << "x" << rh << "\n";
   }
-  if (MemoryTier() == 1) out << "Memory for up to 1440p'+BS+'n";
+  if (MemoryTier() == 1) out << "Memory for up to 1440p\n";
   if (MemoryTier() == 2) out << "Memory for up to 4K\n";
   if (MemoryTier() == 3) out << "Memory for up to 8K\n";
   g_changed = false;

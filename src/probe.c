@@ -254,6 +254,23 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
         fprintf(stderr,"  #%d %s\n",depth,where);
         rbp=frame[0];
     }
+    /* Code that does not keep a frame pointer: return addresses found on the stack. */
+    {
+        uintptr_t stack[96];
+        SIZE_T got=0;
+        if (c->Rsp && ReadProcessMemory(GetCurrentProcess(),(void *)(uintptr_t)c->Rsp,stack,sizeof(stack),&got)) {
+            int shown=0;
+            for (SIZE_T i=0; i<got/sizeof(stack[0]) && shown<12; ++i) {
+                const uintptr_t off=stack[i]-(uintptr_t)image;
+                if (image && stack[i]>(uintptr_t)image && (off<0x1560000 || (off>=0x2820000 && off<0x3400000))) {
+                    if (!shown) fprintf(stderr,"  stack:");
+                    fprintf(stderr," +0x%" PRIxPTR,off);
+                    ++shown;
+                }
+            }
+            if (shown) fputc(10,stderr);
+        }
+    }
     fflush(NULL);
     TerminateProcess(GetCurrentProcess(),3);
     return EXCEPTION_CONTINUE_SEARCH;

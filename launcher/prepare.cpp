@@ -154,7 +154,7 @@ struct SelfFile {
 SelfFile ParseSelf(const Bytes& data) {
   static const uint8_t magic[4] = {'O', 0x15, '=', 0x1d};
   Span(data, 0, 4);
-  if (std::memcmp(data.data(), magic, 4) != 0) Fail("expected PS4 SELF");
+  if (std::memcmp(data.data(), magic, 4) != 0) Fail("this eboot.bin is not a PS4 SELF file. Choose the folder with the version 1.28 update (its eboot.bin is the one the game ships with, not a converted or renamed file)");
   const uint16_t count = Rd<uint16_t>(data, 24);
   const uint64_t base = 32 + uint64_t(count) * 32;
   Span(data, base, 64);
@@ -341,6 +341,14 @@ std::map<std::string, std::string> ParseSfo(const Bytes& d, std::map<std::string
     }
   }
   return out;
+}
+
+bool Version128(const std::map<std::string, std::string>& sfo) {
+  for (const char* key : {"APP_VER", "VERSION"}) {
+    const auto it = sfo.find(key);
+    if (it != sfo.end() && it->second == "01.28") return true;
+  }
+  return false;
 }
 
 bool InitEnvIsRet(const fs::path& libc_path) {
@@ -859,6 +867,14 @@ const ModuleSource kModules[] = {
 
 }  // namespace
 
+bool SfoIsVersion128(const fs::path& param_sfo) {
+  try {
+    return Version128(ParseSfo(ReadFile(param_sfo), nullptr));
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
 std::string PrepareGame(const fs::path& update, const fs::path& base, const fs::path& work, const fs::path& patch_xml,
                         bool patches_only, const std::function<void(int, const std::string&)>& progress) {
   try {
@@ -907,7 +923,10 @@ std::string PrepareGame(const fs::path& update, const fs::path& base, const fs::
     std::map<std::string, uint32_t> ints;
     const auto sfo = ParseSfo(ReadFile(update / "sce_sys" / "param.sfo"), &ints);
     if (sfo.count("TITLE_ID") == 0 || sfo.at("TITLE_ID") != "CUSA00093") return "The update folder is not DriveClub (CUSA00093).";
-    if (sfo.count("APP_VER") == 0 || sfo.at("APP_VER") != "01.28") return "The update folder must be DriveClub version 1.28.";
+    if (!Version128(sfo)) {
+      const auto field = [&](const char* key) { return sfo.count(key) ? sfo.at(key) : std::string("none"); };
+      return "The update folder must be DriveClub version 1.28 (its param.sfo says APP_VER " + field("APP_VER") + ", VERSION " + field("VERSION") + ").";
+    }
     if (!fs::exists(base / "game000.dat")) return "The base game folder has no game000.dat.";
 
     progress(1, "Collecting the game modules");
