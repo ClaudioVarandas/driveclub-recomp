@@ -61,6 +61,7 @@ void runtime_file_report(void);
 void runtime_file_configure(const char *app0, const char *user);
 /* Second game folder searched for /app0 files the first one lacks (update folder first, base game second). */
 void runtime_file_set_base(const char *dir);
+void runtime_file_add_mods(const char *dir);
 int runtime_file_mount(const char *guest, const char *host);
 void runtime_file_unmount(const char *guest);
 int runtime_file_translate(const char *guest, char *out, size_t size);

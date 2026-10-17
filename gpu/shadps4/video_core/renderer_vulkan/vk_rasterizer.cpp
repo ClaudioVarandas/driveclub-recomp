@@ -1470,6 +1470,62 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
         return;
     }
 
+    // The game's light culling reads the depth tile bounds (HTILE). Depth here is a plain image, so
+    // that memory is never written: hand the shader expanded tiles that cover the full depth range,
+    // so no light is dropped or kept by mistake.
+    {
+        static const bool fill_htile = [] {
+            const char* env = std::getenv("BB_HTILE_FILL");
+            return env && std::atoi(env) != 0;  // off unless BB_HTILE_FILL=1: it ran and changed nothing visible
+        }();
+        if (fill_htile) {
+            static struct {
+                VAddr address;
+                u32 bytes;
+                u64 frame;
+            } done[16];
+            const u64 frame = BbStats::gpu_frames.load(std::memory_order_relaxed);
+            for (const auto& desc : cs.buffers) {
+                if (desc.IsSpecial() || desc.is_written) {
+                    continue;
+                }
+                const auto sharp = desc.GetSharp(cs);
+                const VAddr address = sharp.base_address;
+                const auto meta = texture_cache.IsMeta(address);
+                if (!meta || *meta != VideoCore::TextureCache::MetaType::HTile) {
+                    continue;
+                }
+                const u32 bytes = sharp.GetSize() & ~3u;
+                if (!bytes || bytes >= (64u << 20)) {
+                    continue;
+                }
+                bool fresh = false;
+                for (auto& d : done) {
+                    if (d.address == address && d.bytes == bytes) {
+                        fresh = d.frame != frame;
+                        d.frame = frame;
+                        goto found;
+                    }
+                }
+                {
+                    static u32 next;
+                    auto& d = done[next++ % 16];
+                    d = {address, bytes, frame};
+                    fresh = true;
+                }
+            found:
+                if (fresh) {
+                    FillBuffer(address, bytes, 0xFFFC000Fu, false);
+                    static u32 logged;
+                    if (logged++ < 4) {
+                        LOG_WARNING(Render_Vulkan, "HTILE read by a compute shader: filled {:#x} ({} bytes)",
+                                 address, bytes);
+                    }
+                }
+            }
+        }
+    }
+
     if (!BindResources(pipeline)) {
         return;
     }

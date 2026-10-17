@@ -7,7 +7,7 @@
 The source code is in this repository and the build is on the [Releases](../../releases) page.
 
 ## How to play
-1. Download `driveclub-recomp-0.1.0-win64.zip` and extract it anywhere you can write to (not `Program Files`).
+1. Download `driveclub-recomp-0.1.1-win64.zip` and extract it anywhere you can write to (not `Program Files`).
 2. Have **your own** game dumps ready:
    - the **version 1.28 update** folder (it contains `eboot.bin`)
    - the **base game** folder (it contains `game000.dat`)
@@ -23,6 +23,9 @@ Logs are in the `logs` folder.
 - About 60 FPS at 4K in the heaviest scenes on our test PC (RTX 5070 Ti, Ryzen 7 5800X3D), higher in lighter ones, with an unlocked frame rate option in the launcher that keeps the game at its normal speed
 - Runs on NVIDIA, AMD and Intel graphics through Vulkan, with Resizable BAR used automatically where the driver allows it
 - Keyboard racing layout and any gamepad (Xbox, PlayStation, Switch Pro, 8BitDo)
+- DLC content (add-on cars, bikes, tours and livery decals) can be unlocked from the launcher, built from your own game files. Cars you earn by playing still unlock through normal progression
+- A launcher window that resizes from every edge and corner and stays sharp at any display scale
+- A `mods` folder for loose-file mods: files in it replace the game's own files of the same path
 
 ## Controls
 Any gamepad works. Keyboard, mouse and gamepad can be used at the same time.
@@ -54,6 +57,8 @@ The window that opens when you start `DriveClub.exe` has every setting. Press **
 **Resolution:** output from 720p to 8K, render size from 720p to 8K, and ultrawide sizes with a field-of-view fix. Sizes above 1080p use more memory; the needed memory patch is added for you.
 
 **Mirror and reflection updates:** **Live** (default) draws the small scene of mirrors, rain and reflections every frame. **Static (faster)** draws it once and keeps that picture, which is much faster but stops reflections and rain on the glass from updating. The Handheld preset uses it.
+
+**Unlock DLC content:** on by default. Unlocks the add-on cars, bikes, tours and livery decals. The launcher reads the vehicle list, the tour list and the livery list from your own game archive and builds changed copies that the game uses. Your game folders are not modified.
 
 **Gameplay:** player name, borderless fullscreen, FPS counter, motion blur and depth of field off, no reset-to-track timer, no track barriers, and photo mode options.
 

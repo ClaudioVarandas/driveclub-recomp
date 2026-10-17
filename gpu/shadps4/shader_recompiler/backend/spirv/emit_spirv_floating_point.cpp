@@ -39,20 +39,22 @@ Id EmitFPFma64(EmitContext& ctx, IR::Inst* inst, Id a, Id b, Id c) {
     return Decorate(ctx, inst, ctx.OpFma(ctx.F64[1], a, b, c));
 }
 
+// GCN min and max return the other operand when one is NaN, so a shader can clean a NaN up with max(x, 0).
+// OpFMin/OpFMax leave that undefined and a NaN then travels on into the picture.
 Id EmitFPMax32(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMax(ctx.F32[1], a, b);
+    return ctx.OpNMax(ctx.F32[1], a, b);
 }
 
 Id EmitFPMax64(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMax(ctx.F64[1], a, b);
+    return ctx.OpNMax(ctx.F64[1], a, b);
 }
 
 Id EmitFPMin32(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMin(ctx.F32[1], a, b);
+    return ctx.OpNMin(ctx.F32[1], a, b);
 }
 
 Id EmitFPMin64(EmitContext& ctx, Id a, Id b) {
-    return ctx.OpFMin(ctx.F64[1], a, b);
+    return ctx.OpNMin(ctx.F64[1], a, b);
 }
 
 // GCN min/max/clamp return the other operand when one is NaN; OpFMin/OpFMax/OpFClamp leave that undefined.
@@ -155,11 +157,11 @@ Id EmitFPSaturate64(EmitContext& ctx, Id value) {
 }
 
 Id EmitFPClamp32(EmitContext& ctx, Id value, Id min_value, Id max_value) {
-    return ctx.OpFClamp(ctx.F32[1], value, min_value, max_value);
+    return ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, min_value), max_value);
 }
 
 Id EmitFPClamp64(EmitContext& ctx, Id value, Id min_value, Id max_value) {
-    return ctx.OpFClamp(ctx.F64[1], value, min_value, max_value);
+    return ctx.OpNMin(ctx.F64[1], ctx.OpNMax(ctx.F64[1], value, min_value), max_value);
 }
 
 Id EmitFPRoundEven32(EmitContext& ctx, Id value) {

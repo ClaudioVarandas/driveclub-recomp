@@ -93,6 +93,12 @@ void runtime_file_configure(const char *app0,const char *user) {
 }
 static char app0_base[600];
 void runtime_file_set_base(const char *dir) { snprintf(app0_base,sizeof(app0_base),"%s",dir ? dir : ""); }
+/* Files the player puts in this folder replace the game's own files of the same path (read only). */
+static char mods_dirs[4][600];
+static int mods_count;
+void runtime_file_add_mods(const char *dir) {
+    if (dir && *dir && mods_count<4) snprintf(mods_dirs[mods_count++],sizeof(mods_dirs[0]),"%s",dir);
+}
 /* Resolve a guest path to a host path; returns 0 or a host errno. */
 static int translate(const char *guest,char *out,size_t size) {
     if (!guest || !*guest) return ENOENT;
@@ -110,6 +116,18 @@ static int translate(const char *guest,char *out,size_t size) {
     int result=0;
     if (!m) result=ENOENT;
     else if ((size_t)snprintf(out,size,"%s%s",m->host,buffer+best)>=size) result=ENAMETOOLONG;
+    if (!result && mods_count && !strncmp(buffer,"/app0/",6)) {
+        for (int i=0;i<mods_count;++i) {
+            char alt[1024];
+            if ((size_t)snprintf(alt,sizeof(alt),"%s%s",mods_dirs[i],buffer+5)<sizeof(alt) && access(alt,F_OK)==0) {
+                static unsigned used;
+                if (used++<40) printf("Runtime: replaced by mods folder: %s\n",buffer);
+                snprintf(out,size,"%s",alt);
+                pthread_mutex_unlock(&lock);
+                return 0;
+            }
+        }
+    }
     /* Files the update does not carry come from the base game folder (runtime_file_set_base). */
     if (!result && app0_base[0] && !strncmp(buffer,"/app0/",6) && access(out,F_OK)!=0) {
         char alt[1024];

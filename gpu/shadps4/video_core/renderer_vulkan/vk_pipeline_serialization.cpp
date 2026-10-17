@@ -12,7 +12,7 @@
 
 namespace Serialization {
 /* You should increment versions below once corresponding serialization scheme is changed. */
-static constexpr u32 ShaderBinaryVersion = 12u; // interpolated integer fix (Pascal), depth size fix, every undefined read is zero
+static constexpr u32 ShaderBinaryVersion = 13u; // every float min, max and clamp returns the other operand for a NaN
 static constexpr u32 ShaderMetaVersion = 7u; // bbport: ImageResource::needs_native
 static constexpr u32 PipelineKeyVersion = 5u; // bbport: Info layout (ImageResource::needs_native)
 } // namespace Serialization

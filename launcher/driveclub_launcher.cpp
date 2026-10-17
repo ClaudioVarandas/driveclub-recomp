@@ -30,6 +30,7 @@
 
 #include "gpu_check.h"
 #include "prepare.h"
+#include "unlock.h"
 
 using namespace Gdiplus;
 
@@ -85,7 +86,12 @@ FolderRow g_folder[2];  // 0 = update, 1 = base game
 std::wstring g_home, g_data, g_runtime;
 HWND g_hwnd = nullptr;
 HWND g_edit = nullptr;  // the in-place box for the player name
-float g_scale = 1.f, g_content_h = 0;
+float g_scale = 1.f, g_content_h = 0, g_ox = 0, g_oy = 0;
+constexpr float kMaxW = 1700.f;
+float g_win_w = kWinW;       // logical window width: the layout reflows when the window is widened
+float g_win_h = 0;           // logical window height; 0 or less than the content: as tall as the content needs
+float g_natural_h = 0;       // the height the content needs
+float g_row_extra = 0;       // extra space given to every row when the window is taller than the content
 int g_hover_ctl = -1, g_hover_seg = -1, g_hover_btn = -1, g_hover_browse = -1, g_press_btn = -1;
 std::wstring g_status;
 std::wstring g_gpu_problem;  // from CheckGpu() at start; Play stays off while it is set, unless the check is skipped
@@ -260,12 +266,15 @@ void BuildModel() {
                              "@skipgpu", false);
   const int showfps = toggle(L"Show FPS counter", L"Draws the frame rate in the top right corner while playing.", "@fps", false);
   const int full = toggle(L"Fullscreen", L"Plays borderless fullscreen. Turn off for a window.", "@full", true);
+  const int unlock = toggle(L"Unlock DLC content",
+                            L"Unlocks the DLC content: add-on cars, bikes, tours and livery decals. Cars you earn by playing still unlock through normal progression. Built from your own game files; the game folders are not modified.",
+                            "@unlock", true);
   g_cards.push_back({L"FRAME RATE AND RESOLUTION", {g_preset, fps, outres, inres, wide, fov}, 0});
-  g_cards.push_back({L"GAMEPLAY", {pname, g_mirror, full, showfps, blur, reset, barrier, pcol, pproc, skipgpu}, 1,
+  g_cards.push_back({L"GAMEPLAY", {pname, g_mirror, full, unlock, showfps, blur, reset, barrier, pcol, pproc, skipgpu}, 1,
                      L"Community patches for DriveClub version 1.28."});
 }
 
-bool fps_counter = false, fast_render = false, full_screen = true;  // the settings that are not patches
+bool fps_counter = false, fast_render = false, full_screen = true, unlock_dlc = true;  // the settings that are not patches
 
 // Output / render choices per preset: indices into the "Output resolution" and "Render resolution" rows,
 // and the "Mirror and reflection updates" choice (slower presets update the mirrors less often).
@@ -294,6 +303,7 @@ void LoadSettings() {
     if (line.rfind("unlocked=", 0) == 0) unlocked_saved = line.substr(9) == "1";
     if (line.rfind("skip_gpu_check=", 0) == 0) g_skip_gpu_check = line.substr(15) == "1";
     if (line.rfind("full=", 0) == 0) full_screen = line.substr(5) == "1";
+    if (line.rfind("unlock=", 0) == 0) unlock_dlc = line.substr(7) == "1";
   }
   for (auto& c : g_c) if (c.patches[0] == "@name") c.items[0] = g_name;
   CheckFolders();
@@ -314,6 +324,10 @@ void LoadSettings() {
     }
     if (c.kind == Kind::Toggle && c.patches[0] == "@full") {
       c.sel = full_screen ? 1 : 0;
+      continue;
+    }
+    if (c.kind == Kind::Toggle && c.patches[0] == "@unlock") {
+      c.sel = unlock_dlc ? 1 : 0;
       continue;
     }
     if (!has_selection) continue;  // defaults
@@ -359,14 +373,15 @@ void SaveSettings() {
   MakeDirs(g_data + L"\\user");
   {
     std::ofstream ini(IniPath().c_str(), std::ios::binary | std::ios::trunc);
-    bool fps_on = false, fast_on = false, full_on = true;
+    bool fps_on = false, fast_on = false, full_on = true, unlock_on = true;
     for (const auto& c : g_c) {
       if (c.kind == Kind::Toggle && c.patches[0] == "@fps") fps_on = c.sel != 0;
       if (c.kind == Kind::Toggle && c.patches[0] == "@fast") fast_on = c.sel != 0;
       if (c.kind == Kind::Toggle && c.patches[0] == "@full") full_on = c.sel != 0;
+      if (c.kind == Kind::Toggle && c.patches[0] == "@unlock") unlock_on = c.sel != 0;
     }
     ini << "update=" << Narrow(g_folder[0].path) << "\r\nbase=" << Narrow(g_folder[1].path) << "\r\nfps=" << (fps_on ? 1 : 0)
-        << "\r\nfast=" << (fast_on ? 1 : 0) << "\r\nunlocked=" << ((g_fps >= 0 && g_c[g_fps].sel == 3) ? 1 : 0) << "\r\nskip_gpu_check=" << (g_skip_gpu_check ? 1 : 0) << "\r\nmirror=" << (g_mirror >= 0 ? g_c[g_mirror].sel : 0) << "\r\nname=" << Narrow(g_name) <<"\r\nfull=" << (full_on ? 1 : 0) << "\r\n";
+        << "\r\nfast=" << (fast_on ? 1 : 0) << "\r\nunlocked=" << ((g_fps >= 0 && g_c[g_fps].sel == 3) ? 1 : 0) << "\r\nskip_gpu_check=" << (g_skip_gpu_check ? 1 : 0) << "\r\nmirror=" << (g_mirror >= 0 ? g_c[g_mirror].sel : 0) << "\r\nname=" << Narrow(g_name) <<"\r\nfull=" << (full_on ? 1 : 0) << "\r\nunlock=" << (unlock_on ? 1 : 0) << "\r\n";
     // The renderer optimizations that are switched off, as a bit mask. The draw thread is bit 37.
     const std::wstring toggles = g_data + L"\\user\\toggles.txt";
     std::ofstream tog(toggles.c_str(), std::ios::binary | std::ios::trunc);
@@ -402,14 +417,14 @@ void ResetDefaults() {
 // ------------------------------------------------------------------------------------------
 // layout
 // ------------------------------------------------------------------------------------------
-float RowHeight(const Ctl& c) { return c.kind == Kind::Toggle ? 46.f : 70.f; }
+float RowHeight(const Ctl& c) { return (c.kind == Kind::Toggle ? 46.f : 70.f) + g_row_extra; }
 float FolderRowHeight() { return 74.f; }
 
-void Layout() {
-  const float colw = (kWinW - 2 * kMargin - kGap) / 2.f;
+void LayoutPass(float bottom_extra) {
+  const float colw = (g_win_w - 2 * kMargin - kGap) / 2.f;
   // game folders: a full-width card on top
   const float folders_h = kTitleH + 2 * FolderRowHeight() + kPad * 0.4f + 8.f;
-  const RectF folders_rect(kMargin, kHeaderH, kWinW - 2 * kMargin, folders_h);
+  const RectF folders_rect(kMargin, kHeaderH, g_win_w - 2 * kMargin, folders_h);
   float fy = folders_rect.Y + kTitleH;
   for (auto& f : g_folder) {
     f.row = RectF(folders_rect.X + kPad, fy, folders_rect.Width - 2 * kPad, FolderRowHeight());
@@ -434,7 +449,7 @@ void Layout() {
     }
     y[card.column] += h + kGap;
   }
-  const float bottom = (std::max)(y[0], y[1]) - kGap;
+  const float bottom = (std::max)(y[0], y[1]) - kGap + bottom_extra;
   for (int col = 0; col < 2; ++col) {
     for (int k = int(g_cards.size()) - 1; k >= 0; --k) {
       if (g_cards[k].column != col) continue;
@@ -445,11 +460,32 @@ void Layout() {
   g_content_h = bottom + kGap;
   const float bar_y = g_content_h + 2.f;
   const float bw[3] = {170.f, 110.f, 130.f};
-  float x = kWinW - kMargin;
+  float x = g_win_w - kMargin;
   for (int i = 2; i >= 0; --i) {
     x -= bw[i];
     g_btn[i] = RectF(x, bar_y + 14.f, bw[i], 44.f);
     x -= 12.f;
+  }
+}
+
+// Lays the window out for its current size. Wider: the columns widen. Taller: the rows spread out a little and
+// the cards take the rest.
+void Layout() {
+  g_row_extra = 0;
+  LayoutPass(0.f);
+  g_natural_h = g_content_h + kFooterH;
+  const float extra = g_win_h - g_natural_h;
+  if (extra > 1.f) {
+    int rows = 1;
+    for (int col = 0; col < 2; ++col) {
+      int n = 0;
+      for (const auto& card : g_cards) if (card.column == col) n += int(card.ctls.size());
+      rows = (std::max)(rows, n);
+    }
+    g_row_extra = (std::min)(extra / float(rows), 14.f);
+    LayoutPass(0.f);
+    const float left = g_win_h - (g_content_h + kFooterH);
+    if (left > 1.f) LayoutPass(left);
   }
 }
 
@@ -495,7 +531,7 @@ void Text(Graphics& g, const std::wstring& s, const Font& f, const RectF& r, con
   g.DrawString(s.c_str(), -1, &f, r, &fmt, &br);
 }
 
-RectF Scaled(const RectF& r) { return RectF(r.X * g_scale, r.Y * g_scale, r.Width * g_scale, r.Height * g_scale); }
+RectF Scaled(const RectF& r) { return RectF(r.X * g_scale + g_ox, r.Y * g_scale + g_oy, r.Width * g_scale, r.Height * g_scale); }
 
 bool FoldersOk() { return g_folder[0].ok && g_folder[1].ok; }
 
@@ -524,7 +560,7 @@ void Paint(HDC hdc, int w, int h) {
     RectF box;
     g.MeasureString(chip, -1, &fSeg, PointF(0, 0), &measure, &box);
     const float cw = box.Width / S + 52.f;
-    RectF cr = Scaled(RectF(kWinW - kMargin - cw, 32, cw, 30));
+    RectF cr = Scaled(RectF(g_win_w - kMargin - cw, 32, cw, 30));
     const bool chip_ok = FoldersOk() && !GpuBlocked();
     FillRound(g, cr, 15 * S, chip_ok ? Color(255, 28, 52, 38) : Color(255, 60, 40, 28));
     SolidBrush dot(chip_ok ? kOk : kWarn);
@@ -535,7 +571,7 @@ void Paint(HDC hdc, int w, int h) {
 
   // game folders card
   {
-    const RectF cr = Scaled(RectF(kMargin, kHeaderH, kWinW - 2 * kMargin, kTitleH + 2 * FolderRowHeight() + kPad * 0.4f + 8.f));
+    const RectF cr = Scaled(RectF(kMargin, kHeaderH, g_win_w - 2 * kMargin, kTitleH + 2 * FolderRowHeight() + kPad * 0.4f + 8.f));
     FillRound(g, cr, 12 * S, kCard);
     StrokeRound(g, cr, 12 * S, kCardLine);
     Text(g, L"GAME FILES", fCard, RectF(cr.X + kPad * S, cr.Y + 6 * S, cr.Width - 2 * kPad * S, (kTitleH - 6) * S), kMuted);
@@ -606,7 +642,7 @@ void Paint(HDC hdc, int w, int h) {
   }
 
   // footer: hint / status / progress, buttons
-  const float fy = g_content_h * S;
+  const float fy = g_oy + g_content_h * S;
   SolidBrush footer_brush(Color(255, 12, 13, 16));
   g.FillRectangle(&footer_brush, 0.f, fy, float(w), float(h) - fy);
   std::wstring msg = g_status;
@@ -628,7 +664,7 @@ void Paint(HDC hdc, int w, int h) {
     mc = kMuted;
   }
   {
-    const RectF fr(kMargin * S, fy + 8 * S, (g_btn[0].X - kMargin - 12) * S, (kFooterH - 16) * S);
+    const RectF fr(g_ox + kMargin * S, fy + 8 * S, (g_btn[0].X - kMargin - 12) * S, (kFooterH - 16) * S);
     StringFormat mfmt;
     mfmt.SetTrimming(StringTrimmingNone);
     float px = 12.5f;
@@ -711,10 +747,25 @@ std::wstring StartGame() {
   SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
   HANDLE log = CreateFileW((g_home + L"\\logs\\driveclub_" + Timestamp() + L".log").c_str(), GENERIC_WRITE, FILE_SHARE_READ,
                            &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  MakeDirs(g_home + L"\\mods");
   const std::wstring prep = g_data + L"\\prep", user = g_data + L"\\user";
+  // Add-on content: changed copies of three data lists, built from the player's own archive. Files in the mods
+  // folder come first, so a player's own versions win.
+  std::wstring unlock_arg;
+  bool unlock_on = true;
+  for (const Ctl& c : g_c) {
+    if (c.kind == Kind::Toggle && c.patches[0] == "@unlock") unlock_on = c.sel != 0;
+  }
+  if (unlock_on) {
+    const std::wstring unlock_dir = g_data + L"\\unlock";
+    const std::wstring problem = BuildUnlock(g_folder[0].path, g_folder[1].path, unlock_dir);
+    if (problem.empty()) unlock_arg = L" --mods \"" + unlock_dir + L"\"";
+    else MessageBoxW(nullptr, (L"The add-on content could not be unlocked (" + problem + L"). The game starts without it.").c_str(), L"DriveClub", MB_OK | MB_ICONWARNING);
+  }
   std::wstring cmd = L"\"" + exe + L"\" \"" + prep + L"\\boot-linked.bin\" --content-profile \"" + prep +
                      L"\\content.bin\" --patches \"" + prep + L"\\patches.bin\" --app0 \"" + g_folder[0].path +
-                     L"\" --app0-base \"" + g_folder[1].path + L"\" --user \"" + user + L"\" --stub-unresolved";
+                     L"\" --app0-base \"" + g_folder[1].path + L"\" --user \"" + user + L"\" --mods \"" + g_home + L"\\mods\"" +
+                     unlock_arg + L" --stub-unresolved";
   SetEnvironmentVariableW(L"BB_GPU_USER_DIR", user.c_str());
   {
     // With the deltatime patch the game times itself by the wall clock, so each frame must be shown as soon as
@@ -872,6 +923,34 @@ int HitBrowse(float x, float y) {
 
 LRESULT CALLBACK WndProc(HWND h, UINT m, WPARAM w, LPARAM l) {
   switch (m) {
+    case WM_SIZE: {
+      // The layout keeps its scale and reflows: wider windows get wider columns, taller ones more room.
+      if (w == SIZE_MINIMIZED || g_scale <= 0.f) return 0;
+      g_win_w = (std::max)(kWinW, (std::min)(kMaxW, float(LOWORD(l)) / g_scale));
+      g_win_h = float(HIWORD(l)) / g_scale;
+      Layout();
+      InvalidateRect(h, nullptr, FALSE);
+      return 0;
+    }
+    case WM_GETMINMAXINFO: {
+      RECT wr, cr;
+      GetWindowRect(h, &wr);
+      GetClientRect(h, &cr);
+      const int ncw = (wr.right - wr.left) - cr.right, nch = (wr.bottom - wr.top) - cr.bottom;
+      auto* mm = reinterpret_cast<MINMAXINFO*>(l);
+      mm->ptMinTrackSize.x = LONG(kWinW * g_scale) + ncw;
+      mm->ptMinTrackSize.y = LONG((g_natural_h > 0 ? g_natural_h : TotalHeight()) * g_scale) + nch;
+      mm->ptMaxTrackSize.x = LONG(kMaxW * g_scale) + ncw;
+      return 0;
+    }
+    case WM_DPICHANGED: {
+      // Moved to a screen with another scale: take the size Windows suggests and draw at that scale.
+      g_scale = float(HIWORD(w)) / 96.f;
+      const RECT* r = reinterpret_cast<const RECT*>(l);
+      SetWindowPos(h, nullptr, r->left, r->top, r->right - r->left, r->bottom - r->top, SWP_NOZORDER | SWP_NOACTIVATE);
+      InvalidateRect(h, nullptr, FALSE);
+      return 0;
+    }
     case WM_PAINT: {
       PAINTSTRUCT ps;
       HDC dc = BeginPaint(h, &ps);
@@ -1081,7 +1160,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int show) {
   g_scale = float(GetDeviceCaps(screen, LOGPIXELSX)) / 96.f;
   ReleaseDC(nullptr, screen);
   Layout();
-  const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX;
+  const DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX | WS_THICKFRAME;  // every edge and corner resizes
   RECT rc{0, 0, LONG(kWinW * g_scale), LONG(TotalHeight() * g_scale)};
   AdjustWindowRect(&rc, style, FALSE);
   g_hwnd = CreateWindowExW(0, wc.lpszClassName, L"DriveClub - PC", style,
