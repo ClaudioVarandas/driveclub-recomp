@@ -6,8 +6,15 @@
 
 The source code is in this repository and the build is on the [Releases](../../releases) page.
 
+## New in 0.2.0: DLSS and FSR anti-aliasing
+The game's own anti-aliasing is replaced by a modern one, chosen in the launcher:
+- **NVIDIA DLAA** (GeForce RTX) for the sharpest, steadiest picture: thin lines, wires, fences and foliage stay clean.
+- **AMD FSR 3.1** on any graphics card, with no special hardware and nothing extra to install.
+
+Both work at the native resolution and use the game's own camera motion. In the game the overlay shows what is active, **F9** switches the new anti-aliasing off and on to compare, and **F10** switches between FSR and DLSS on RTX cards.
+
 ## How to play
-1. Download `driveclub-recomp-0.1.1-win64.zip` and extract it anywhere you can write to (not `Program Files`).
+1. Download the latest `driveclub-recomp-<version>-win64.zip` from the [Releases](../../releases) page and extract it anywhere you can write to (not `Program Files`).
 2. Have **your own** game dumps ready:
    - the **version 1.28 update** folder (it contains `eboot.bin`)
    - the **base game** folder (it contains `game000.dat`)
@@ -45,7 +52,7 @@ Any gamepad works. Keyboard, mouse and gamepad can be used at the same time.
 | D-pad | Arrow keys |
 | Look around | I J K L or the mouse |
 
-F7 turns mouse look on or off. The bindings are in `data\user\input_config\default.ini` and can be changed there.
+F7 turns mouse look on or off. F9 and F10 are the anti-aliasing keys above. The bindings are in `data\user\input_config\default.ini` and can be changed there.
 
 ## Settings
 The window that opens when you start `DriveClub.exe` has every setting. Press **Play** to save them; they are kept for later starts.
@@ -58,6 +65,8 @@ The window that opens when you start `DriveClub.exe` has every setting. Press **
 
 **Mirror and reflection updates:** **Live** (default) draws the small scene of mirrors, rain and reflections every frame. **Static (faster)** draws it once and keeps that picture, which is much faster but stops reflections and rain on the glass from updating. The Handheld preset uses it.
 
+**Anti-aliasing:** **Game** keeps the original. **FSR 3.1** works on any graphics card, **DLAA (RTX)** needs a GeForce RTX card; if it is not available the launcher falls back to FSR. Do not turn on the community patch "Disable motion blur and depth of field" with it: they do not work together and the game keeps its own anti-aliasing then.
+
 **Unlock DLC content:** on by default. Unlocks the add-on cars, bikes, tours and livery decals. The launcher reads the vehicle list, the tour list and the livery list from your own game archive and builds changed copies that the game uses. Your game folders are not modified.
 
 **Gameplay:** player name, borderless fullscreen, FPS counter, motion blur and depth of field off, no reset-to-track timer, no track barriers, and photo mode options.
@@ -66,6 +75,7 @@ The window that opens when you start `DriveClub.exe` has every setting. Press **
 
 ## Known issues
 - **Some reflections are too bright**, for example rain drops on the side window and the paint on cars on the stage select screen.
+- **Anti-aliasing:** fast cars can leave a faint trail, because cars have no motion data of their own yet.
 - **Static (faster)** stops reflections and rain on the glass from updating.
 - **The processor is the limit.** Heavy scenes (many cars, trees and rain) drop frames first on slower CPUs.
 - **First play builds shaders:** short stutters in the first minutes until they are cached. This gets better on later runs.
