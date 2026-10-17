@@ -73,6 +73,97 @@ static void protect(void *p, size_t size, unsigned flags) {
     if (mprotect(p, size, mode)) fail("mprotect failed");
 #endif
 }
+/* SSE4a (EXTRQ, INSERTQ) exists on the PS4's Jaguar and on AMD CPUs; Intel CPUs raise #UD on it.
+ * Register forms only (memory operands do not exist): 66|F2 [REX] 0F 78|79 ModRM(mod 11) [ib ib]. */
+typedef struct { int length, insert, immediate, dst, src; unsigned len, idx; } Sse4a;
+static int decode_sse4a(const unsigned char *p, Sse4a *o) {
+    if (p[0] != 0x66 && p[0] != 0xf2) return 0;
+    const unsigned rex = (p[1] & 0xf0) == 0x40 ? p[1] : 0;
+    const unsigned char *op = p + (rex ? 2 : 1);
+    if (op[0] != 0x0f || (op[1] != 0x78 && op[1] != 0x79) || (op[2] & 0xc0) != 0xc0) return 0;
+    o->insert = p[0] == 0xf2;
+    o->immediate = op[1] == 0x78;
+    o->dst = ((op[2] >> 3) & 7) | (rex & 4 ? 8 : 0);
+    o->src = (op[2] & 7) | (rex & 1 ? 8 : 0);
+    if (o->immediate && !o->insert) { /* extrq xmm, len, idx: 66 0F 78 /0 */
+        if ((op[2] >> 3) & 7) return 0;
+        o->dst = o->src;
+    }
+    o->length = (int)(op - p) + 3 + (o->immediate ? 2 : 0);
+    o->len = o->immediate ? op[3] & 63u : 0;
+    o->idx = o->immediate ? op[4] & 63u : 0;
+    return 1;
+}
+static int host_has_sse4a(void) {
+    unsigned a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000000u), "c"(0));
+    if (a < 0x80000001u) return 0;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(0x80000001u), "c"(0));
+    return (c >> 6) & 1;
+}
+static int host_has_sse41(void) {
+    unsigned a, b, c, d;
+    __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1u), "c"(0));
+    return (c >> 19) & 1;
+}
+/* On a host without SSE4a, `extrq xmm, len, idx` in guest code is rewritten before entry:
+ * extrq x, 8, 0  -> pmovzxbq x, x (same low qword; SSE4.1), padded with nop, in place;
+ * any other      -> jmp to a stub: psllq x, 64-idx-len; psrlq x, 64-len; jmp back.
+ * EXTRQ leaves the upper qword undefined, so neither replacement has to preserve it. The stubs
+ * go in the unmapped pages between an executable segment and the next one (the padding of the
+ * segment's last page stays free for patch code caves). Sites that do not fit, and the other
+ * SSE4a forms, are emulated in the fault handler (Windows). */
+static uint64_t rewrite_sse4a(Segment *segments, uint64_t count, uint64_t image_size, uint64_t *left) {
+    const int sse41 = host_has_sse41();
+    uint64_t rewritten = 0;
+    *left = 0;
+    for (uint64_t s = 0; s < count; ++s) {
+        if (!(segments[s].flags & 1) || segments[s].size < 8) continue;
+        const uint64_t start = segments[s].address, stub_begin = round_page(start + segments[s].size);
+        uint64_t stub_end = round_page(image_size), used = 0;
+        for (uint64_t i = 0; i < count; ++i)
+            if (segments[i].address >= stub_begin && segments[i].address < stub_end) stub_end = segments[i].address;
+        unsigned char *at = image + start, *end = image + start + segments[s].size - 7;
+        for (; at <= end; ++at) {
+            Sse4a o;
+            if (!decode_sse4a(at, &o) || o.insert || !o.immediate) continue;
+            const unsigned len = o.len ? o.len : 64;
+            if (len + o.idx > 64) { ++*left; continue; }
+            const unsigned char rex = o.dst >= 8 ? 0x41 : 0, reg = o.dst & 7;
+            unsigned char code[16];
+            int n = 0;
+            if (len == 8 && !o.idx && sse41) {
+                code[n++] = 0x66;
+                if (o.dst >= 8) code[n++] = 0x45;
+                code[n++] = 0x0f; code[n++] = 0x38; code[n++] = 0x32; code[n++] = (unsigned char)(0xc0 | reg << 3 | reg);
+            } else if (len < 64) {
+                unsigned char stub[24];
+                int k = 0;
+                const unsigned shifts[2][2] = {{6, 64 - o.idx - len}, {2, 64 - len}}; /* /6 psllq, /2 psrlq */
+                for (int j = 0; j < 2; ++j) {
+                    if (!shifts[j][1]) continue;
+                    stub[k++] = 0x66;
+                    if (rex) stub[k++] = rex;
+                    stub[k++] = 0x0f; stub[k++] = 0x73; stub[k++] = (unsigned char)(0xc0 | shifts[j][0] << 3 | reg);
+                    stub[k++] = (unsigned char)shifts[j][1];
+                }
+                const uint64_t here = stub_begin + used, site = (uint64_t)(at - image);
+                if (here + k + 5 > stub_end) { ++*left; at += o.length - 1; continue; }
+                int32_t back = (int32_t)((site + o.length) - (here + k + 5)), to = (int32_t)(here - (site + 5));
+                stub[k++] = 0xe9; memcpy(stub + k, &back, 4); k += 4;
+                memcpy(image + here, stub, (size_t)k);
+                used += (uint64_t)k;
+                code[n++] = 0xe9; memcpy(code + n, &to, 4); n += 4;
+            } /* else extrq x, 64, 0 leaves the low qword unchanged: all nop */
+            memset(code + n, 0x90, (size_t)(o.length - n));
+            memcpy(at, code, (size_t)o.length);
+            ++rewritten;
+            at += o.length - 1;
+        }
+        if (used) segments[s].size = stub_begin + used - start; /* mapped executable with the segment */
+    }
+    return rewritten;
+}
 static int stub_unresolved; /* --stub-unresolved: development aid, log each missing import once and return 0 */
 static ABI uint64_t unresolved_soft(uint32_t id, uintptr_t argument) {
     static unsigned char seen[4096];
@@ -179,6 +270,28 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
             c->Rdx=1;
             c->Rip=(DWORD64)(uintptr_t)bb_longjmp;
             return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    if (code==EXCEPTION_ILLEGAL_INSTRUCTION && image) {
+        /* SSE4a guest instructions left after rewrite_sse4a run here, one fault each. */
+        CONTEXT *c=info->ContextRecord;
+        uintptr_t rip=(uintptr_t)c->Rip;
+        Sse4a o;
+        if (rip-(uintptr_t)image<runtime_image_size && decode_sse4a((const unsigned char *)rip,&o)) {
+            M128A *x=c->FltSave.XmmRegisters;
+            unsigned len=o.len, idx=o.idx;
+            if (!o.immediate) {
+                uint64_t control=o.insert ? (uint64_t)x[o.src].High : x[o.src].Low;
+                len=control&63; idx=(control>>8)&63;
+            }
+            if (!len) len=64;
+            if (len+idx<=64) {
+                uint64_t mask=len==64 ? ~UINT64_C(0) : (UINT64_C(1)<<len)-1;
+                if (o.insert) x[o.dst].Low=(x[o.dst].Low&~(mask<<idx))|((x[o.src].Low&mask)<<idx);
+                else x[o.dst].Low=(x[o.dst].Low>>idx)&mask;
+                c->Rip+=o.length;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
         }
     }
     if (code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_ILLEGAL_INSTRUCTION || code==EXCEPTION_PRIV_INSTRUCTION ||
@@ -652,6 +765,11 @@ int main(int argc, char **argv) {
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
+    const char *sse4a_rewrite=getenv("BB_SSE4A_REWRITE"); /* 1 forces it on, 0 leaves every site to the fault handler */
+    if (sse4a_rewrite ? strcmp(sse4a_rewrite,"0")!=0 : !host_has_sse4a()) {
+        uint64_t left, rewritten=rewrite_sse4a(segments, ns, size, &left);
+        printf("SSE4a: %" PRIu64 " guest EXTRQ rewritten, %" PRIu64 " left to the fault handler\n", rewritten, left);
+    }
     protect(traps, round_page((import_count + 1) * 32), 5);
     protect(image, round_page(size), 0);
     int executable_entry = 0;
