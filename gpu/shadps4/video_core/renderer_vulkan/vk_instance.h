@@ -256,9 +256,11 @@ public:
     /// shaders were compiled for 64 lanes but ran at the driver's own width (random colored fog
     /// and characters). Those cards use the 32-wide path, which
     /// NVIDIA runs: compute pinned to 32 and the recompiler lowering wave64 code for 32 lanes.
+    /// Vertex is not required: RADV lets the size be required in fragment and compute but not in
+    /// vertex (requiredSubgroupSizeStages 0xf0), and on the 32-wide path it draws colored blocks
+    /// and noisy edges. Vertex shaders keep the driver's width there (CanRequireSubgroupSize).
     bool IsSubgroupSize64Supported() const {
-        constexpr auto stages = vk::ShaderStageFlagBits::eVertex |
-                                vk::ShaderStageFlagBits::eFragment |
+        constexpr auto stages = vk::ShaderStageFlagBits::eFragment |
                                 vk::ShaderStageFlagBits::eCompute;
         return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64 &&
                (vk13_props.requiredSubgroupSizeStages & stages) == stages;
