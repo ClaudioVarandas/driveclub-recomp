@@ -420,7 +420,15 @@ void UpscaleSize(int& rw, int& rh, const char*& name) {
   name = q == 1 ? "Quality" : q == 2 ? "Balanced" : "Performance";
 }
 
-int MemoryTier() {
+// The output size counts too: 4K output with the Default render size crashed at boot on the default
+// memory budget, since the presented images are output-sized.
+int OutputMemoryTier() {
+  if (g_outres < 0) return 0;
+  const int o = g_c[g_outres].sel;  // output: Default 720p 1440p 1800p 4K 5K 8K
+  return o >= 5 ? 3 : o >= 3 ? 2 : o == 2 ? 1 : 0;
+}
+
+int RenderMemoryTier() {
   if (UpscaleActive()) {
     int rw, rh;
     const char* name;
@@ -433,6 +441,8 @@ int MemoryTier() {
   if (w > 0 || r >= 3) return 2;
   return r == 2 ? 1 : 0;
 }
+
+int MemoryTier() { return (std::max)(RenderMemoryTier(), OutputMemoryTier()); }
 
 // Output / render choices per preset: indices into the "Output resolution" and "Render resolution" rows.
 void ApplyPreset(int preset) {
