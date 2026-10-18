@@ -84,7 +84,7 @@ The window that opens when you start `DriveClub.exe` has every setting. Press **
 
 ## Notes
 - You must supply your own, legally obtained dump of the game. No game files are included.
-- **Tested with:** DriveClub, title ID `CUSA00093`, version 1.28. Other versions and repacked dumps have not been tested and may not work.
+- **Tested with:** DriveClub, title ID `CUSA00093`, version 1.28. The European release (`CUSA00003`) version 1.28 is accepted too and has been played less. Other versions and repacked dumps have not been tested and may not work.
 - SmartScreen may warn (*More info*, then *Run anyway*). Verify with the checksum.
 - Requires Windows 10/11 64-bit, a processor from Intel Haswell (2013) or AMD Excavator or Ryzen onward, and a graphics card with a Vulkan 1.3 driver. About 40 GB of free space is needed for the game dumps.
 
