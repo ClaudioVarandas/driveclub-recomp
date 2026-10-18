@@ -21,6 +21,12 @@ static constexpr auto AllGraphicsStageBits =
     vk::ShaderStageFlagBits::eTessellationEvaluation | vk::ShaderStageFlagBits::eGeometry |
     vk::ShaderStageFlagBits::eFragment;
 
+/// bbport: with the driver's cache cold (after a driver update) hundreds of pipelines are built at
+/// once while the game loads, and the driver now and then fails one with an unknown or
+/// out-of-memory error, which used to end the game. True when the result may go away and the
+/// caller should build the pipeline again (after a pause). Gives up after 5 attempts.
+bool RetryPipelineCreation(vk::Result result, u32 attempt, const char* kind, const char* name);
+
 class Instance;
 class Scheduler;
 class DescriptorHeap;

@@ -17,6 +17,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
+#include "video_core/renderer_vulkan/vk_frame_generation.h"
 #include "bbport_overlay.h"
 #include "bbport_settings.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
@@ -183,6 +184,8 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
 Presenter::~Presenter() {
     rasterizer->GetUpscaler().SetFrameGenerator(nullptr);
 
+    // Frame generation reads the frames and their generated images: drain it before them.
+    frame_generator.reset();
     draw_scheduler.Finish();
     present_scheduler.Finish();
     flip_scheduler.Finish();
@@ -378,6 +381,9 @@ Frame* Presenter::PrepareLastFrame() {
         }
         if (result == vk::Result::eTimeout) {
             continue;
+        }
+        if (result == vk::Result::eErrorDeviceLost) {
+            instance.LogDeviceLost();
         }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
@@ -578,6 +584,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // bbport: frame generation: the frames between the previous frame and this one.
     frame->generated_count = 0;
     frame_generator->SetOutputSize(frame->width, frame->height);
+    constexpr auto fg_color_usage =
+        vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst |
+        vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled;
+    std::array<FrameGenerator::Output, FrameGenerator::MaxGenerated> fg_outputs{};
     // bbport: also for the upscaled display (outputs other than 1080p): composed the same way.
     if (frame_generator->Wanted() && frame_generator->Paused()) {
         frame_generator->Skip(); // paused with F8: everything stays set up
@@ -612,24 +622,27 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
                 .subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
             };
             cmdbuf.pipelineBarrier2({.imageMemoryBarrierCount = 1, .pImageMemoryBarriers = &to_target});
+            if (auto* prof = FgProfiler::Get()) {
+                prof->Mark(cmdbuf, FgProfileHudless, "fg hudless upscale+pp");
+            }
             const auto scaled = fsr_pass.Render(cmdbuf, source, hudless_size,
                                                 {frame->width, frame->height}, fsr_settings,
                                                 frame->is_hdr);
             pp_pass.Render(cmdbuf, scaled, hudless_size, hudless_frame, pp_settings);
+            if (auto* prof = FgProfiler::Get()) {
+                prof->Mark(cmdbuf, FgProfileFrame, "rest of the game's frame (draw queue)");
+            }
             hudless = hudless_frame.image;
             hudless_view = hudless_frame.image_view;
         }
         // Also with none: a frame without generation starts the sequence over.
-        std::array<FrameGenerator::Output, FrameGenerator::MaxGenerated> outputs{};
         for (u32 i = 0; i < count; ++i) {
-            outputs[i] = {frame->generated[i].image, frame->generated[i].view};
+            fg_outputs[i] = {frame->generated[i].image, frame->generated[i].view};
         }
         frame->generated_count = frame_generator->Generate(
-            cmdbuf, frame->image, frame->image_view,
-            vk::ImageUsageFlagBits::eColorAttachment | vk::ImageUsageFlagBits::eTransferDst |
-                vk::ImageUsageFlagBits::eTransferSrc | vk::ImageUsageFlagBits::eSampled,
-            hudless, hudless_view, frame->width, frame->height,
-            std::span<const FrameGenerator::Output>{outputs.data(), count}, cpu_address);
+            cmdbuf, frame->image, frame->image_view, fg_color_usage, hudless, hudless_view,
+            frame->width, frame->height,
+            std::span<const FrameGenerator::Output>{fg_outputs.data(), count}, cpu_address);
     }
     if (frame_dump) {
         // The presented image as the swapchain blit reads it (General after the pass), and
@@ -648,7 +661,6 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
         }
         DumpRaw(instance, draw_scheduler, cmdbuf, frame->image, vk::ImageLayout::eGeneral,
                 frame->width, frame->height, "output", frame_dump_index);
-        ++frame_dump_index;
     }
 
     // Flush frame creation commands.
@@ -656,6 +668,10 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+
+    if (frame_dump) {
+        ++frame_dump_index;
+    }
 
     // bbport: the GPU command thread runs at most BB_FRAMES_AHEAD (default 1) guest frames
     // ahead of the GPU: it waits here for the frame that many flips back. When the GPU is the
@@ -1208,6 +1224,9 @@ Frame* Presenter::GetRenderFrame() {
 
     // Wait for the presentation to be finished so all frame resources are free
     while (wait() != vk::Result::eSuccess) {
+        if (result == vk::Result::eErrorDeviceLost) {
+            instance.LogDeviceLost();
+        }
         ASSERT_MSG(result != vk::Result::eErrorDeviceLost,
                    "Device lost during waiting for a frame");
         // Retry if the waiting times out

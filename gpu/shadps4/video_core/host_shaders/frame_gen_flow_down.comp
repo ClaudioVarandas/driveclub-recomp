@@ -1,0 +1,30 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Frame generation, optical flow: a half size luma image of a picture or of a smaller luma image.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D src_tex;
+layout(binding = 1, r16f) uniform writeonly image2D dst_img;
+
+layout(push_constant) uniform Constants {
+    ivec2 dst_size;
+    ivec2 src_size;
+    float color; // 1: the source is a picture, 0: a luma image
+};
+
+float luma(ivec2 p) {
+    const vec4 t = texelFetch(src_tex, clamp(p, ivec2(0), src_size - 1), 0);
+    return color > 0.5 ? dot(t.rgb, vec3(0.299, 0.587, 0.114)) : t.r;
+}
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, dst_size))) {
+        return;
+    }
+    const ivec2 s = p * 2;
+    const float v = 0.25 * (luma(s) + luma(s + ivec2(1, 0)) + luma(s + ivec2(0, 1)) + luma(s + ivec2(1, 1)));
+    imageStore(dst_img, p, vec4(v));
+}

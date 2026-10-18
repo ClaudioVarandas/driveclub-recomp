@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
+#include <cstdlib>
 #include "video_core/renderer_vulkan/vk_drive_motion.h"
 
 #include <cmath>
@@ -22,6 +23,7 @@ struct Push {
     Mat clip_to_prev_clip;
     std::array<float, 2> size;
     std::array<float, 2> scale;
+    float use_stencil;
 };
 
 Mat Multiply(const Mat& a, const Mat& b) {
@@ -86,13 +88,17 @@ bool Invert(const Mat& m, Mat& out) {
 
 DriveMotion::DriveMotion(const Instance& instance) {
     const auto device = instance.GetDevice();
-    const std::array<vk::DescriptorSetLayoutBinding, 2> bindings = {{
+    const std::array<vk::DescriptorSetLayoutBinding, 3> bindings = {{
         {.binding = 0,
          .descriptorType = vk::DescriptorType::eSampledImage,
          .descriptorCount = 1,
          .stageFlags = vk::ShaderStageFlagBits::eCompute},
         {.binding = 1,
          .descriptorType = vk::DescriptorType::eStorageImage,
+         .descriptorCount = 1,
+         .stageFlags = vk::ShaderStageFlagBits::eCompute},
+        {.binding = 2,
+         .descriptorType = vk::DescriptorType::eSampledImage,
          .descriptorCount = 1,
          .stageFlags = vk::ShaderStageFlagBits::eCompute},
     }};
@@ -145,7 +151,7 @@ bool DriveMotion::ClipToPrevious(std::array<float, 16>& out) const {
 }
 
 void DriveMotion::Record(vk::CommandBuffer cmdbuf, vk::ImageView depth_view,
-                         vk::ImageView motion_view, u32 width, u32 height, u32 src_width,
+                         vk::ImageView mask_view, vk::ImageView motion_view, u32 width, u32 height, u32 src_width,
                          u32 src_height, bool normalized) {
     Push push{};
     ClipToPrevious(push.clip_to_prev_clip);
@@ -158,7 +164,14 @@ void DriveMotion::Record(vk::CommandBuffer cmdbuf, vk::ImageView depth_view,
                                              .imageLayout = vk::ImageLayout::eGeneral};
     const vk::DescriptorImageInfo motion_info{.imageView = motion_view,
                                               .imageLayout = vk::ImageLayout::eGeneral};
-    const std::array<vk::WriteDescriptorSet, 2> writes = {{
+    push.use_stencil = mask_view != depth_view ? 1.0f : 0.0f;
+    const vk::DescriptorImageInfo mask_info{.imageView = mask_view,
+                                            .imageLayout = vk::ImageLayout::eGeneral};
+    const std::array<vk::WriteDescriptorSet, 3> writes = {{
+        {.dstBinding = 2,
+         .descriptorCount = 1,
+         .descriptorType = vk::DescriptorType::eSampledImage,
+         .pImageInfo = &mask_info},
         {.dstBinding = 0,
          .descriptorCount = 1,
          .descriptorType = vk::DescriptorType::eSampledImage,

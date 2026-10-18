@@ -305,7 +305,7 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
 
 extern "C" void bbgpu_print_recent_passes(void) {
     const u32 end = BbRecent::next.load(std::memory_order_relaxed);
-    const u32 count = std::min<u32>(end, 24);
+    const u32 count = std::min<u32>(end, 48);
     if (!count) {
         return;
     }
@@ -320,6 +320,16 @@ extern "C" void bbgpu_print_recent_passes(void) {
     }
     std::fputc(10, stdout);
     std::fflush(stdout);
+}
+
+extern "C" const char* bbgpu_sibling_path(const char* name) {
+    static thread_local std::string path;
+    path = BbQuarantine::Sibling(name);
+    return path.c_str();
+}
+
+extern "C" void bbgpu_note_device_lost(void) {
+    BbQuarantine::NoteDeviceLost();
 }
 
 extern "C" unsigned long long bbgpu_flip_count(void) {

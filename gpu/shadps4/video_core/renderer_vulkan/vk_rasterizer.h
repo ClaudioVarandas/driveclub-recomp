@@ -327,6 +327,7 @@ private:
     Core::MemoryManager* memory;
     boost::icl::interval_set<VAddr> mapped_ranges;
     Common::SharedFirstMutex mapped_ranges_mutex;
+    std::atomic<u64> mapped_ranges_generation{0}; ///< bbport: bumped by every map and unmap
     PipelineCache pipeline_cache;
     std::unique_ptr<DrawPreparation> draw_prep;
     std::unique_ptr<DriveAA> drive_aa;

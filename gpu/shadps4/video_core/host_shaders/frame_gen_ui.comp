@@ -23,8 +23,12 @@ void main() {
     const vec3 color = texelFetch(color_tex, pixel, 0).rgb;
     const vec3 hudless = texelFetch(hudless_tex, pixel, 0).rgb;
     const vec3 difference = abs(color - hudless);
-    // Both went through the same passes: equal outside the UI up to rounding and dithering.
-    if (max(difference.r, max(difference.g, difference.b)) > 24.0 / 255.0) {
-        imageStore(generated_img, pixel, vec4(color, 1.0));
+    // Both went through the same passes: equal outside the UI (exactly, measured). A soft edge keeps
+    // the faint parts of the UI (glows, translucent panels) steady from frame to frame.
+    const float difference_max = max(difference.r, max(difference.g, difference.b));
+    const float alpha = clamp((difference_max - 1.0 / 255.0) / (3.0 / 255.0), 0.0, 1.0);
+    if (alpha > 0.0) {
+        const vec3 generated = imageLoad(generated_img, pixel).rgb;
+        imageStore(generated_img, pixel, vec4(mix(generated, color, alpha), 1.0));
     }
 }

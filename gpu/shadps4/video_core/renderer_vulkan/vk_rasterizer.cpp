@@ -1542,6 +1542,9 @@ void Rasterizer::DispatchRecord(const ComputePipeline* pipeline) {
     const auto& cs_program = CsRegs();
 
     const auto& cs = pipeline->GetStage(Shader::SwStage::Compute);
+    if (BbQuarantine::Contains(cs.pgm_hash)) {
+        return;
+    }
     // After the resource binding: its transfers (image uploads, downloads) mark themselves.
     const auto mark = [&] {
         if (auto* profiler = GpuProfiler::Get()) {
@@ -3507,14 +3510,31 @@ bool Rasterizer::IsMapped(VAddr addr, u64 size) {
     }
     const auto range = decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
 
-    Common::RecursiveSharedLock lock{mapped_ranges_mutex};
-    return boost::icl::contains(mapped_ranges, range);
+    // bbport: each thread checks its own copy of the set, taken again after a map or unmap: the
+    // shared lock (a mutex and a condition variable per call) showed in the CPU profile. BB_MAPPED_COPIES=0 locks.
+    static const bool copies = [] {
+        const char* env = std::getenv("BB_MAPPED_COPIES");
+        return !(env && env[0] == '0');
+    }();
+    if (!copies || BbToggle::Disabled(BbToggle::MappedRangeCopies)) {
+        Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+        return boost::icl::contains(mapped_ranges, range);
+    }
+    thread_local decltype(mapped_ranges) ranges;
+    thread_local u64 generation = ~u64{0};
+    if (mapped_ranges_generation.load(std::memory_order_acquire) != generation) {
+        Common::RecursiveSharedLock lock{mapped_ranges_mutex};
+        ranges = mapped_ranges;
+        generation = mapped_ranges_generation.load(std::memory_order_relaxed);
+    }
+    return boost::icl::contains(ranges, range);
 }
 
 void Rasterizer::MapMemory(VAddr addr, u64 size) {
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges += decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        mapped_ranges_generation.fetch_add(1, std::memory_order_release);
     }
 }
 
@@ -3529,6 +3549,7 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
     {
         std::scoped_lock lock{mapped_ranges_mutex};
         mapped_ranges -= decltype(mapped_ranges)::interval_type::right_open(addr, addr + size);
+        mapped_ranges_generation.fetch_add(1, std::memory_order_release);
     }
 }
 

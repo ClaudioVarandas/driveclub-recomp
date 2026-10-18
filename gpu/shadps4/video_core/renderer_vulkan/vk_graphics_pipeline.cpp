@@ -246,7 +246,9 @@ GraphicsPipeline::GraphicsPipeline(
         .requiredSubgroupSize = 64,
     };
     for (auto& stage : shader_stages) {
-        stage.pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr;
+        stage.pNext = instance.IsSubgroupSize64Supported() && instance.CanRequireSubgroupSize(stage.stage)
+                          ? &subgroup_size_ci
+                          : nullptr;
     }
 
     const auto depth_format =
@@ -422,6 +424,13 @@ GraphicsPipeline::GraphicsPipeline(
 
     auto [pipeline_result, pipe] =
         device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+    for (u32 attempt = 1; pipeline_result != vk::Result::eSuccess &&
+                          RetryPipelineCreation(pipeline_result, attempt, "graphics", debug_str.c_str());
+         ++attempt) {
+        auto retried = device.createGraphicsPipelineUnique(pipeline_cache, pipeline_info);
+        pipeline_result = retried.result;
+        pipe = std::move(retried.value);
+    }
     if (pipeline_result != vk::Result::eSuccess) {
         LOG_CRITICAL(Render_Vulkan, "Failed to create graphics pipeline ({}): {}", debug_str,
                      vk::to_string(pipeline_result));

@@ -27,6 +27,14 @@ echo "$VERSION" > "$OUT/version.txt"
 ldd out/DriveClubGame.exe | awk '{print $3}' | grep -i '/msys64/' | sort -u | while read -r dll; do
   cp "$dll" "$OUT/runtime/"
 done
+# And the DLLs those DLLs load (two more rounds reach everything MinGW libraries pull in).
+for round in 1 2; do
+  for staged in "$OUT"/runtime/*.dll; do
+    ldd "$staged" 2>/dev/null | awk '{print $3}' | { grep -i '/msys64/' || true; } | sort -u | while read -r dll; do
+      [ -f "$OUT/runtime/$(basename "$dll")" ] || cp "$dll" "$OUT/runtime/"
+    done
+  done
+done
 # DLSS frame generation: the bridge built from gpu/dlss_bridge and NVIDIA's DLSS libraries.
 cp packaging/dlss_bin/bbport_dlss.dll packaging/dlss_bin/nvngx_dlss.dll packaging/dlss_bin/nvngx_dlssg.dll "$OUT/runtime/"
 mkdir -p "$OUT/licenses"
@@ -37,6 +45,15 @@ for extra in SDL3.dll; do
 done
 # The program files of the release, so the launcher can tell when some are missing.
 (cd "$OUT/runtime" && find . -type f ! -name files.txt | sed 's|^\./||' | sort > files.txt)
+# Nothing of the game, the console firmware or the player may end up in the package.
+leaks="$(find "$OUT" -type f \( -iname 'eboot.bin' -o -iname '*.sprx' -o -iname '*.prx' -o -iname '*.pkg' -o -iname '*.sfo' \
+  -o -iname '*.psarc' -o -iname 'game*.dat' -o -iname 'game.ndx' -o -iname '*.log' -o -iname '*.spv' -o -iname '*.dmp' \
+  -o -iname 'launcher.ini' -o -path '*/data/*' -o -path '*/logs/*' -o -path '*/sce_sys/*' \) -print)"
+if [ -n "$leaks" ]; then
+  echo "Package leak check failed, these files must not ship:" >&2
+  echo "$leaks" >&2
+  exit 1
+fi
 echo "files: $(find "$OUT" -type f | wc -l), size: $(du -sh "$OUT" | cut -f1)"
 python - "$OUT" "release/$NAME.zip" <<'PYEOF'
 import os, sys, zipfile

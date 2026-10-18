@@ -27,6 +27,9 @@ struct VmaAllocationInfo;
 namespace VideoCore {
 
 /// Hints and requirements for the backing memory type of a commit
+/// bbport: default place of the stream buffer for a GPU vendor (BB_STREAM_MEMORY overrides).
+void SetStreamPlacementDefault(u32 vendor_id);
+
 enum class MemoryType : u8 {
     DeviceLocal,  ///< Requests device local buffer.
     HostUncached, ///< Requires a host visible memory type optimized for CPU to GPU uploads

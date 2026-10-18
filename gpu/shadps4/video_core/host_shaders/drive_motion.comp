@@ -8,12 +8,14 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform texture2D depth_tex; // reversed Z: 1 at the near plane, 0 far away
 layout(binding = 1, rg16f) uniform writeonly image2D motion_img;
+layout(binding = 2) uniform utexture2D mask_tex; // stencil of the scene depth
 
 layout(push_constant) uniform Constants {
     vec2 src_size;          // the game's render size (depth)
     mat4 clip_to_prev_clip; // the game's row-vector matrix, uploaded as stored
     vec2 size;              // render pixels
     vec2 scale;             // output scale: 1 for pixels, 1 / size for screen fractions
+    float use_stencil;      // 1: the stencil view is real
 };
 
 void main() {
@@ -32,6 +34,10 @@ void main() {
         const vec2 prev_ndc = prev.xy / prev.w;
         const vec2 prev_uv = vec2(prev_ndc.x * 0.5 + 0.5, 0.5 - prev_ndc.y * 0.5);
         motion = (prev_uv - uv) * size;
+    }
+    // The player's car, the hands and the other cars keep their place on the screen far better than the world does.
+    if (use_stencil > 0.5 && (texelFetch(mask_tex, src, 0).r & 130u) != 0u) {
+        motion = vec2(0.0);
     }
     imageStore(motion_img, pixel, vec4(motion * scale, 0.0, 0.0));
 }

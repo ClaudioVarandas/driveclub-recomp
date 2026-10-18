@@ -15,6 +15,8 @@
 #include <chrono>
 #include <deque>
 #include <span>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "common/types.h"
@@ -27,6 +29,69 @@ namespace Vulkan {
 
 class Instance;
 class Scheduler;
+
+/// BB_FG_PROFILE=1: GPU time of the frame generation stages, from timestamp pairs written
+/// straight into the command buffer (no scheduler interaction: the game's GpuProfiler is
+/// bound to the game thread's frame rhythm and stalls when FG marks join it). Read back
+/// without waiting four frames later; a line every 5 s. All calls are on the GPU thread.
+class FgProfiler {
+public:
+    /// The profiler of the queue that captures (the game's draw queue), when BB_FG_PROFILE=1.
+    static FgProfiler* Get() noexcept {
+        return instance_ptr;
+    }
+    /// The profiler of the queue that interpolates. A separate pool: with frame generation on
+    /// its own queue the two queues' timestamps are not ordered against each other, so mixing
+    /// them in one pool would produce meaningless deltas.
+    static FgProfiler* GetFg() noexcept {
+        return fg_ptr;
+    }
+    static void Init(const Instance& instance);
+    /// Starts a segment labelled `label`; the segment runs to the next mark of this frame.
+    void Mark(vk::CommandBuffer cmdbuf, u64 key, const char* label);
+    /// Next game frame: closes the last segment, reads a finished frame, prints every 5 s.
+    void BeginFrame(vk::CommandBuffer cmdbuf);
+
+private:
+    FgProfiler(const Instance& instance, const char* name);
+    void Write(vk::CommandBuffer cmdbuf, u64 key);
+    void Collect(u32 which);
+    void Print();
+
+    static constexpr u32 NumSlices = 4;
+    static constexpr u32 SliceQueries = 1024;
+    static inline FgProfiler* instance_ptr = nullptr;
+    static inline FgProfiler* fg_ptr = nullptr;
+
+    const char* name;
+    vk::Device device;
+    vk::UniqueQueryPool pool;
+    double period_ns = 1.0;
+    u32 slice = 0;
+    std::array<std::vector<u64>, NumSlices> keys;
+    std::array<u32, NumSlices> used{};
+    std::array<bool, NumSlices> pending{};
+    std::unordered_map<u64, std::string> labels;
+    struct Total {
+        double ms = 0;
+        u64 segments = 0;
+    };
+    std::unordered_map<u64, Total> totals;
+    u64 frames = 0;
+    std::chrono::steady_clock::time_point window = std::chrono::steady_clock::now();
+};
+
+/// The stage labels of FgProfiler (keys, so the marks are cheap). A mark starts the segment
+/// named by the mark after it: "motion" is the time from the capture mark to the motion mark.
+enum FgProfileKey : u64 {
+    FgProfileFrame = 1,    ///< game-side present chain and everything between FG stages
+    FgProfileCapture = 2,  ///< barriers and setup before the depth/motion dispatches
+    FgProfileMotion = 3,   ///< the depth/motion/mask dispatches (the size being tested)
+    FgProfileHudless = 4,  ///< the picture before the UI, upscaled and post-processed
+    FgProfileEvaluate = 5, ///< FSR/DLSS frame interpolation
+    FgProfileCompose = 6,  ///< the UI over the generated frames
+    FgProfileTail = 7,     ///< after FG: the game's own rendering of the next frame
+};
 
 /// The game's camera of a frame: near and far planes, vertical field of view (radians).
 struct FrameGenCamera {
@@ -80,7 +145,8 @@ public:
         return active ? std::array<u32, 2>{active->input_width, active->input_height}
                       : std::array<u32, 2>{0, 0};
     }
-    vk::ImageView BeginCapture(vk::CommandBuffer cmdbuf, vk::ImageView depth, u32 w, u32 h, u64 address);
+    vk::ImageView BeginCapture(vk::CommandBuffer cmdbuf, vk::ImageView depth, vk::ImageView stencil, u32 w,
+                               u32 h, u64 address);
     using Camera = FrameGenCamera;
     /// Writes zero motion (a still camera) into the image BeginCapture returned.
     void ZeroMotion(vk::CommandBuffer cmdbuf);
@@ -117,6 +183,8 @@ private:
     u32 GenerateDlss(vk::CommandBuffer cmdbuf, vk::Image color, vk::ImageView color_view,
                      vk::Image hudless, vk::ImageView hudless_view, u32 width, u32 height,
                      std::span<const Output> outputs, u32 count, float frame_ms);
+    void ComputeFlow(vk::CommandBuffer cmdbuf, vk::ImageView picture, u32 width, u32 height,
+                     bool normalized);
     /// Where `color` and `hudless` differ (the UI), `color` replaces the generated pixels.
     void ComposeUi(vk::CommandBuffer cmdbuf, vk::ImageView color, vk::ImageView hudless,
                    const Output& output, u32 width, u32 height);
@@ -126,7 +194,6 @@ private:
 
     const Instance& instance;
     Scheduler& scheduler;
-
     /// What is captured for one game frame, kept per display buffer: the flip of a frame is
     /// processed after the game's thread has begun the next one, so each frame needs its own.
     struct HudlessView {
@@ -139,7 +206,8 @@ private:
         // Inputs at render size
         VideoCore::UniqueImage depth_image;  ///< R32F hardware depth
         VideoCore::UniqueImage motion_image; ///< RG16F pixels, previous - current
-        vk::UniqueImageView depth_view, motion_view;
+        VideoCore::UniqueImage mask_image;   ///< R8: 1 where something moves on its own (cars, hands)
+        vk::UniqueImageView depth_view, motion_view, mask_view;
         u32 input_width = 0, input_height = 0;
         // The picture before the UI, as the game drew it (display buffer format).
         VideoCore::UniqueImage hudless_image;
@@ -148,6 +216,7 @@ private:
         std::vector<HudlessView> hudless_views;
         bool hudless_captured = false; ///< this frame's
         bool captured = false;         ///< BeginCapture ran since the last Generate
+        bool camera_valid = false;     ///< the game's camera was known (a race, not a menu)
         std::array<float, 2> capture_jitter{};
         Camera capture_camera{};
     };
@@ -163,6 +232,23 @@ private:
     vk::UniqueDescriptorSetLayout ui_desc_layout;
     vk::UniquePipelineLayout ui_pipeline_layout;
     vk::UniquePipeline ui_pipeline;
+    struct FlowStage {
+        vk::UniqueDescriptorSetLayout desc;
+        vk::UniquePipelineLayout layout;
+        vk::UniquePipeline pipeline;
+    };
+    struct FlowImage {
+        VideoCore::UniqueImage image;
+        vk::UniqueImageView view;
+    };
+    FlowStage flow_down, flow_cost, flow_final, flow_pick;
+    FlowImage cost; ///< the scores of the candidate vectors of the player's car
+    std::array<std::array<FlowImage, 3>, 2> pyramid;
+    std::array<FlowImage, 3> flow;
+    u32 flow_width = 0, flow_height = 0;
+    u32 cur_pyramid = 0;
+    bool prev_valid = false;
+
     bool reset = true;
     int last_provider = 0;
     bool last_hudless = false;

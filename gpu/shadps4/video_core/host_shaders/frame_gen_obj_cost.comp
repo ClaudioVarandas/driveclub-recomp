@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Frame generation, the player's car: its screen motion between two pictures as one vector. One
+// work group scores one candidate vector (the mean luma difference over the car's pixels of this
+// level); frame_gen_obj_pick.comp takes the best. A car is rigid enough for one vector, and a
+// vector per pixel was noise.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(binding = 0) uniform texture2D cur_tex;
+layout(binding = 1) uniform texture2D prev_tex;
+layout(binding = 2) uniform texture2D mask_tex;   // full size: 1 for the player's car
+layout(binding = 3) uniform texture2D center_tex; // 1x1: the best vector of the level above
+layout(binding = 4, rg32f) uniform writeonly image2D cost_img; // x: mean difference, y: pixels
+
+layout(push_constant) uniform Constants {
+    ivec2 size;
+    ivec2 mask_size;
+    int radius;
+    int scale; // pixels of the full picture per texel of this level
+    int has_center;
+};
+
+shared float sums[256];
+shared float counts[256];
+
+void main() {
+    const ivec2 center = has_center == 1 ? ivec2(round(texelFetch(center_tex, ivec2(0), 0).rg * 2.0)) : ivec2(0);
+    const ivec2 d = center + ivec2(gl_WorkGroupID.xy) - radius;
+    const uint lane = gl_LocalInvocationIndex;
+    float sum = 0.0;
+    float count = 0.0;
+    const int total = size.x * size.y;
+    for (int i = int(lane); i < total; i += 256) {
+        const ivec2 p = ivec2(i % size.x, i / size.x);
+        const ivec2 f = min(p * scale + scale / 2, mask_size - 1);
+        if (texelFetch(mask_tex, f, 0).r < 0.75) {
+            continue;
+        }
+        const ivec2 q = clamp(p + d, ivec2(0), size - 1);
+        sum += abs(texelFetch(cur_tex, p, 0).r - texelFetch(prev_tex, q, 0).r);
+        count += 1.0;
+    }
+    sums[lane] = sum;
+    counts[lane] = count;
+    barrier();
+    for (uint step = 128u; step > 0u; step >>= 1u) {
+        if (lane < step) {
+            sums[lane] += sums[lane + step];
+            counts[lane] += counts[lane + step];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        imageStore(cost_img, ivec2(gl_WorkGroupID.xy), vec4(sums[0] / max(counts[0], 1.0), counts[0], 0.0, 0.0));
+    }
+}

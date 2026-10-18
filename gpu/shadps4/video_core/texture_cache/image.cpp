@@ -222,6 +222,15 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
         result = vmaCreateImage(allocator, &image_ci_unsafe, &alloc_ci, &unsafe_image, &allocation,
                                 &alloc_info);
     }
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+        // The budget shrinks as other programs take video memory, and going over it ended the
+        // game. Past it the driver moves memory out to system memory: slower, but it goes on.
+        LOG_WARNING(Render_Vulkan, "Allocating an image went over the memory budget, allocating it past the budget");
+        VmaAllocationCreateInfo over_budget_ci = alloc_ci;
+        over_budget_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+        result = vmaCreateImage(allocator, &image_ci_unsafe, &over_budget_ci, &unsafe_image,
+                                &allocation, &alloc_info);
+    }
     BbStats::alloc_count[1].fetch_add(1, std::memory_order_relaxed);
     BbStats::alloc_bytes[1].fetch_add(alloc_info.size, std::memory_order_relaxed);
     ASSERT_MSG(result == VK_SUCCESS, "Failed allocating image with error {}",

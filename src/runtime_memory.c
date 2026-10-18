@@ -61,20 +61,74 @@ _Static_assert(sizeof(BatchEntry)==32,"PS4 batch map entry layout");
 /* Region table lock. Lookups (GPU per-draw queries, VirtualQuery, GPU page
  * protection) share it; map/unmap/protect take it exclusively. Both nest: code
  * under the lock may write guest memory, and a GPU-tracked page then faults into
- * runtime_memory_gpu_protect on the same thread. Readers nest because glibc's
- * default rwlock prefers readers; a thread holding it exclusively skips relocking. */
-static pthread_rwlock_t lock=PTHREAD_RWLOCK_INITIALIZER;
+ * runtime_memory_gpu_protect on the same thread, or waits on the GPU thread, which takes
+ * the lock again. So readers must never wait for a writer that is only queued: a reader-preferring
+ * lock (glibc's default). winpthreads' pthread_rwlock is not one (its writer holds an internal
+ * mutex while it waits for the readers, so a nested reader behind it blocks for good, and every
+ * acquisition costs that mutex). Readers here take a single atomic operation. A thread holding
+ * the lock exclusively skips relocking. */
+#define RW_WRITER 0x80000000u   /* a writer holds the lock */
+#define RW_WAITING 0x40000000u  /* a writer waits for the readers to leave */
+static volatile uint32_t rw_state;
+static pthread_mutex_t rw_mutex=PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t rw_readers_done=PTHREAD_COND_INITIALIZER, rw_writer_done=PTHREAD_COND_INITIALIZER;
+static pthread_rwlock_t legacy_lock=PTHREAD_RWLOCK_INITIALIZER;
+/* BB_MEM_LOCK=pthread: the old pthread rwlock (an A/B and a way back for a support case). */
+static int legacy_mode=-1;
+static int use_legacy(void) {
+    if (legacy_mode<0) { const char *e=getenv("BB_MEM_LOCK"); legacy_mode=(e && e[0]=='p') ? 1 : 0; printf("Runtime: memory table lock: %s\n", legacy_mode ? "pthread rwlock (BB_MEM_LOCK)" : "reader-preferring atomic lock"); }
+    return legacy_mode;
+}
 static __thread unsigned exclusive_depth;
 /* Odd while a writer holds the lock; readers' region caches are valid for one even value. */
 static uint64_t table_generation;
+static void rw_read_lock(void) {
+    if (use_legacy()) { pthread_rwlock_rdlock(&legacy_lock); return; }
+    for (;;) {
+        uint32_t s=__atomic_load_n(&rw_state,__ATOMIC_RELAXED);
+        if (!(s&RW_WRITER)) {
+            if (__atomic_compare_exchange_n(&rw_state,&s,s+1,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) return;
+            continue;
+        }
+        pthread_mutex_lock(&rw_mutex);
+        while (__atomic_load_n(&rw_state,__ATOMIC_ACQUIRE)&RW_WRITER) pthread_cond_wait(&rw_writer_done,&rw_mutex);
+        pthread_mutex_unlock(&rw_mutex);
+    }
+}
+static void rw_read_unlock(void) {
+    if (use_legacy()) { pthread_rwlock_unlock(&legacy_lock); return; }
+    const uint32_t s=__atomic_sub_fetch(&rw_state,1,__ATOMIC_RELEASE);
+    if (s==RW_WAITING) { pthread_mutex_lock(&rw_mutex); pthread_cond_broadcast(&rw_readers_done); pthread_mutex_unlock(&rw_mutex); }
+}
+static void rw_write_lock(void) {
+    if (use_legacy()) { pthread_rwlock_wrlock(&legacy_lock); return; }
+    pthread_mutex_lock(&rw_mutex);
+    for (;;) {
+        uint32_t s=__atomic_load_n(&rw_state,__ATOMIC_RELAXED);
+        if (!(s&~RW_WAITING)) {
+            if (__atomic_compare_exchange_n(&rw_state,&s,RW_WRITER,0,__ATOMIC_ACQUIRE,__ATOMIC_RELAXED)) break;
+            continue;
+        }
+        __atomic_fetch_or(&rw_state,RW_WAITING,__ATOMIC_RELAXED);
+        pthread_cond_wait(&rw_readers_done,&rw_mutex);
+    }
+    pthread_mutex_unlock(&rw_mutex);
+}
+static void rw_write_unlock(void) {
+    if (use_legacy()) { pthread_rwlock_unlock(&legacy_lock); return; }
+    pthread_mutex_lock(&rw_mutex);
+    __atomic_store_n(&rw_state,0,__ATOMIC_RELEASE);
+    pthread_cond_broadcast(&rw_writer_done);
+    pthread_mutex_unlock(&rw_mutex);
+}
 static void write_lock(void) {
-    if (!exclusive_depth++) { pthread_rwlock_wrlock(&lock); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
+    if (!exclusive_depth++) { rw_write_lock(); __atomic_add_fetch(&table_generation,1,__ATOMIC_ACQ_REL); }
 }
 static void write_unlock(void) {
-    if (!--exclusive_depth) { __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE); pthread_rwlock_unlock(&lock); }
+    if (!--exclusive_depth) { __atomic_add_fetch(&table_generation,1,__ATOMIC_RELEASE); rw_write_unlock(); }
 }
-static void read_lock(void) { if (!exclusive_depth) pthread_rwlock_rdlock(&lock); }
-static void read_unlock(void) { if (!exclusive_depth) pthread_rwlock_unlock(&lock); }
+static void read_lock(void) { if (!exclusive_depth) rw_read_lock(); }
+static void read_unlock(void) { if (!exclusive_depth) rw_read_unlock(); }
 static Block blocks[LIMIT];
 static Vma *vmas; static size_t vma_count, vma_capacity;
 #ifndef _WIN32
@@ -562,10 +616,25 @@ static ABI int32_t reserve_range(void **inout, uint64_t size, int flags, uint64_
     if (!result) printf("Runtime: reserved virtual range %p, size=%" PRIu64 "\n", *inout, size);
     return result;
 }
+/* The whole range already has this protection (and type): as on the PS4 kernel, a protect that
+ * changes nothing does nothing. Games re-apply read-write to their pool chunks during play, and
+ * re-protecting them dropped the renderer's write tracking there (stale GPU data) and sent the
+ * range through the invalidate hook (re-uploads). */
+static int unchanged(uintptr_t start, uintptr_t end, int prot, int type) {
+    size_t i=vma_index(start);
+    for (uintptr_t at=start; at<end; ++i) {
+        if (i==vma_count || vmas[i].start>at || vmas[i].prot!=prot || (type>=0 && vmas[i].type!=type)) return 0;
+        at=vmas[i].end;
+    }
+    return 1;
+}
 static int32_t protect_locked(uintptr_t start, uint64_t size, int prot, int type) {
     uintptr_t end=start+align_up(size,PAGE);
     start&=~(uintptr_t)(PAGE-1);
     if ((prot & ~0x37) || !covered(start,end,0)) return INVALID;
+    static int noop=-1;
+    if (noop<0) { const char *e=getenv("BB_PROTECT_NOOP"); noop=(e && e[0]=='0') ? 0 : 1; printf("Runtime: protect without a change is %s\n", noop ? "skipped" : "applied (BB_PROTECT_NOOP=0)"); }
+    if (noop && unchanged(start,end,prot,type)) return 0;
     if (host_protect(start,end-start,host_prot(prot))) return INVALID;
     int error; size_t i=carve(start,end,&error);
     if (error) return mem_fail(NO_MEMORY, __LINE__);

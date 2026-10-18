@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <atomic>
+#include <cstdlib>
+#include <string_view>
 #include <numeric>
 
 #include "bbport_toggles.h"
@@ -33,12 +36,53 @@ std::string_view BufferTypeName(MemoryType type) {
     }
 }
 
+/// bbport: where the stream buffer lives (BB_STREAM_MEMORY=device|host|cached). Every draw
+/// copies its small read-only buffers from guest memory into it on the Vulkan recording thread.
+/// "device" (shadPS4's choice) is VRAM written through the PCIe BAR: cheap with AMD Smart Access
+/// Memory on a desktop, but on a laptop NVIDIA GPU these writes took half of that thread's time
+/// on laptops measured so. "cached" is cached system memory the GPU reads over PCIe
+/// instead; "host" is uncached system memory. The default is cached on NVIDIA and Intel and
+/// device on AMD (SetStreamPlacementDefault).
+enum class StreamPlacement { Device, Host, Cached };
+static std::atomic<int> stream_default{int(StreamPlacement::Device)};
+static StreamPlacement StreamMemory() {
+    static const StreamPlacement placement = [] {
+        const char* env = std::getenv("BB_STREAM_MEMORY");
+        if (!env) {
+            return StreamPlacement(stream_default.load());
+        }
+        const std::string_view value = env;
+        if (value == "device") {
+            return StreamPlacement::Device;
+        }
+        return value == "host" ? StreamPlacement::Host : StreamPlacement::Cached;
+    }();
+    static const bool reported = [] {
+        std::printf("GPU: stream buffer in %s memory\n",
+                    placement == StreamPlacement::Device ? "device" : placement == StreamPlacement::Host ? "host" : "cached host");
+        return true;
+    }();
+    (void)reported;
+    return placement;
+}
+
+void SetStreamPlacementDefault(u32 vendor_id) {
+    // NVIDIA 0x10DE, Intel 0x8086: cached system memory. AMD keeps VRAM (Smart Access Memory).
+    stream_default = int(vendor_id == 0x1002 ? StreamPlacement::Device : StreamPlacement::Cached);
+}
+
 [[nodiscard]] VkMemoryPropertyFlags MemoryUsagePreferredVmaFlags(MemoryType type) {
+    if (type == MemoryType::Stream && StreamMemory() == StreamPlacement::Cached) {
+        return VK_MEMORY_PROPERTY_HOST_COHERENT_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    }
     return type != MemoryType::DeviceLocal ? VK_MEMORY_PROPERTY_HOST_COHERENT_BIT
                                            : VkMemoryPropertyFlagBits{};
 }
 
 [[nodiscard]] VmaAllocationCreateFlags MemoryUsageVmaFlags(MemoryType type) {
+    if (type == MemoryType::Stream && StreamMemory() == StreamPlacement::Cached) {
+        return VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT;
+    }
     switch (type) {
     case MemoryType::HostUncached:
     case MemoryType::Stream:
@@ -53,6 +97,9 @@ std::string_view BufferTypeName(MemoryType type) {
 }
 
 [[nodiscard]] VmaMemoryUsage MemoryUsageVma(MemoryType type) {
+    if (type == MemoryType::Stream && StreamMemory() != StreamPlacement::Device) {
+        return VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+    }
     switch (type) {
     case MemoryType::DeviceLocal:
     case MemoryType::Stream:
@@ -103,6 +150,16 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkBuffer unsafe_buffer{};
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            // The budget shrinks as other programs take video memory; past it the driver moves
+            // memory out to system memory instead of the game ending.
+            LOG_WARNING(Render_Vulkan, "Allocating a buffer of {} bytes went over the memory budget, allocating it past the budget",
+                        buffer_ci.size);
+            VmaAllocationCreateInfo over_budget_ci = alloc_ci;
+            over_budget_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &over_budget_ci, &unsafe_buffer,
+                                     &allocation, out_alloc_info);
+        }
         BbStats::alloc_count[0].fetch_add(1, std::memory_order_relaxed);
         BbStats::alloc_bytes[0].fetch_add(buffer_ci_unsafe.size, std::memory_order_relaxed);
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",

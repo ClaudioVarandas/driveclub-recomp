@@ -27,6 +27,9 @@
 
 #include <vk_mem_alloc.h>
 
+extern "C" void bbgpu_print_recent_passes(void);
+extern "C" void bbgpu_note_device_lost(void);
+
 namespace VideoCore {
 
 static constexpr size_t GDS_BUFFER_SIZE = 64_KB;
@@ -1051,6 +1054,9 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
 
     info.AddWait(signal_sema, signal_tick);
     auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.LogDeviceLost();
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     pending_binds.clear();

@@ -8,11 +8,14 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(binding = 0) uniform texture2D depth_tex; // D32 depth aspect, render size
 layout(binding = 1, r32f) uniform writeonly image2D depth_img;
+layout(binding = 2) uniform utexture2D stencil_tex; // stencil of the same depth
+layout(binding = 3, r8) uniform writeonly image2D mask_img;   // 1: the player's car, 0.5: the hands and other cars
 
 layout(push_constant) uniform Constants {
     vec2 src_size; // the game's render size
     vec2 size;  // output pixels (the frame size the generator works at)
     float flip; // 1: write 1 - depth (FSR wants 0 at the near plane), 0: keep the game's depth
+    float use_stencil; // 1: the stencil view is real
 };
 
 void main() {
@@ -25,4 +28,7 @@ void main() {
     const ivec2 src = ivec2(min((vec2(pixel) + 0.5) / size * src_size, src_size - 1.0));
     const float depth = texelFetch(depth_tex, src, 0).r;
     imageStore(depth_img, pixel, vec4(flip > 0.5 ? 1.0 - depth : depth, 0.0, 0.0, 0.0));
+    // Stencil 2: the player's car (it moves on the screen on its own), 128: the hands and other cars.
+    const uint stencil = use_stencil > 0.5 ? texelFetch(stencil_tex, src, 0).r : 0u;
+    imageStore(mask_img, pixel, vec4((stencil & 2u) != 0u ? 1.0 : ((stencil & 128u) != 0u ? 0.5 : 0.0)));
 }

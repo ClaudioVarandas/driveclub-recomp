@@ -1122,20 +1122,40 @@ void TextureCache::GarbageCollectImages() {
         ticks_to_destroy = std::min(ticks_to_destroy, gc_tick);
         num_deletions = aggresive ? 40 : pressured ? 20 : 10;
     };
+    // bbport: an image that cannot be freed now (GPU-written tiled, or one that needs a download
+    // while there is no pressure) used to use up a deletion and stay at the front of the queue.
+    // When the oldest images were all of that kind every pass freed nothing and texture memory
+    // only grew (12.5 GB on a 9.3 GB budget in our logs). Such an image now moves to the back of
+    // the queue for free, and a pass looks at no more than 256 images. BB_GC_SKIP_FIX=0 reverts.
+    static const bool skip_fix = [] {
+        const char* env = std::getenv("BB_GC_SKIP_FIX");
+        return !(env && env[0] == '0');
+    }();
+    u32 visits = 0;
     const auto clean_up = [&](ImageId image_id) {
         if (num_deletions == 0) {
             return true;
         }
-        --num_deletions;
         auto& image = slot_images[image_id];
         const bool download = image.SafeToDownload();
         const bool tiled = image.info.IsTiled();
-        if (tiled && download) {
-            // This is a workaround for now. We can't handle non-linear image downloads.
-            return false;
-        }
-        if (download && !pressured) {
-            return false;
+        // This is a workaround for now. We can't handle non-linear image downloads.
+        const bool cannot_free = (tiled && download) || (download && !pressured);
+        if (skip_fix) {
+            if (++visits > 256) {
+                return true;
+            }
+            if (cannot_free) {
+                lru_cache.Touch(image.lru_id, gc_tick);
+                ++gc_skipped;
+                return false;
+            }
+            --num_deletions;
+        } else {
+            --num_deletions;
+            if (cannot_free) {
+                return false;
+            }
         }
         if (download) {
             // bbport: synchronously, while the image still protects its pages. A deferred
@@ -1167,6 +1187,7 @@ void TextureCache::GarbageCollectImages() {
     if (total_used_memory >= critical_gc_memory) {
         // If we are still over the critical limit, run an aggressive GC
         configure(true);
+        visits = 0;
         lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, clean_up);
     }
     // bbport: evictions under memory pressure, at most every 5 s (BB_FRAME_STATS or not).
@@ -1178,9 +1199,10 @@ void TextureCache::GarbageCollectImages() {
                         (unsigned long long)(total_used_memory >> 20),
                         (unsigned long long)(pressure_gc_memory >> 20),
                         (unsigned long long)(critical_gc_memory >> 20),
-                        (unsigned long long)gc_evictions, (unsigned long long)gc_downloads);
+                        (unsigned long long)gc_evictions, (unsigned long long)gc_downloads,
+                        (unsigned long long)gc_skipped);
             gc_report_time = now;
-            gc_evictions = gc_downloads = 0;
+            gc_evictions = gc_downloads = gc_skipped = 0;
         }
     }
 }

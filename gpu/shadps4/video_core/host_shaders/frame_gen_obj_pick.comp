@@ -1,0 +1,58 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Frame generation, the player's car: the best of the scored candidate vectors (see
+// frame_gen_obj_cost.comp). Standing still wins unless another vector is clearly better.
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 64) in;
+
+layout(binding = 0) uniform texture2D cost_tex;
+layout(binding = 1) uniform texture2D center_tex; // 1x1: the best vector of the level above
+layout(binding = 2, rg16f) uniform writeonly image2D best_img; // 1x1
+
+layout(push_constant) uniform Constants {
+    int radius;
+    int has_center;
+    float lambda;    // cost per pixel of vector length
+    float min_count; // fewer pixels than this: no car
+};
+
+shared float best_cost[64];
+shared int best_index[64];
+
+void main() {
+    const int side = 2 * radius + 1;
+    const uint lane = gl_LocalInvocationIndex;
+    float cost = 1e9;
+    int index = radius * side + radius;
+    for (int i = int(lane); i < side * side; i += 64) {
+        const ivec2 c = ivec2(i % side, i / side);
+        const vec2 t = texelFetch(cost_tex, c, 0).rg;
+        const float k = t.y >= min_count ? t.x + lambda * length(vec2(c - radius)) : 1e9;
+        if (k < cost) {
+            cost = k;
+            index = i;
+        }
+    }
+    best_cost[lane] = cost;
+    best_index[lane] = index;
+    barrier();
+    for (uint step = 32u; step > 0u; step >>= 1u) {
+        if (lane < step && best_cost[lane + step] < best_cost[lane]) {
+            best_cost[lane] = best_cost[lane + step];
+            best_index[lane] = best_index[lane + step];
+        }
+        barrier();
+    }
+    if (lane == 0u) {
+        const int zero = radius * side + radius;
+        const vec2 zero_cost = texelFetch(cost_tex, ivec2(zero % side, zero / side), 0).rg;
+        int pick = best_index[0];
+        // Not clearly better than standing still (or no car): keep the vector of the level above.
+        if (best_cost[0] >= 1e8 || best_cost[0] > 0.9 * zero_cost.x) {
+            pick = zero;
+        }
+        const vec2 center = has_center == 1 ? round(texelFetch(center_tex, ivec2(0), 0).rg * 2.0) : vec2(0.0);
+        imageStore(best_img, ivec2(0), vec4(center + vec2(ivec2(pick % side, pick / side) - radius), 0.0, 0.0));
+    }
+}

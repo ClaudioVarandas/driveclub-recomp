@@ -22,10 +22,12 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     const auto debug_str = GetDebugString();
 
     const vk::PipelineShaderStageRequiredSubgroupSizeCreateInfo subgroup_size_ci = {
-        .requiredSubgroupSize = 64,
+        .requiredSubgroupSize = instance.IsSubgroupSize64Supported() ? 64u : 32u,
     };
     const vk::PipelineShaderStageCreateInfo shader_ci = {
-        .pNext = instance.IsSubgroupSize64Supported() ? &subgroup_size_ci : nullptr,
+        .pNext = instance.IsSubgroupSize64Supported() || instance.IsComputeSubgroupSize32Required()
+                     ? &subgroup_size_ci
+                     : nullptr,
         .stage = vk::ShaderStageFlagBits::eCompute,
         .module = module,
         .pName = "main",
@@ -108,6 +110,14 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     };
     auto [pipeline_result, pipe] =
         instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
+    for (u32 attempt = 1; pipeline_result != vk::Result::eSuccess &&
+                          RetryPipelineCreation(pipeline_result, attempt, "compute", debug_str.c_str());
+         ++attempt) {
+        auto retried =
+            instance.GetDevice().createComputePipelineUnique(pipeline_cache, compute_pipeline_ci);
+        pipeline_result = retried.result;
+        pipe = std::move(retried.value);
+    }
     ASSERT_MSG(pipeline_result == vk::Result::eSuccess, "Failed to create compute pipeline: {}",
                vk::to_string(pipeline_result));
     pipeline = std::move(pipe);

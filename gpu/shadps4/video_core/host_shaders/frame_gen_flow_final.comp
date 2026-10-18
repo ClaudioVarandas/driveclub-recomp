@@ -1,0 +1,36 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Frame generation, optical flow: the finest flow, as the vectors of the generator (pixels of
+// the vector image, or screen fractions).
+#version 450
+#extension GL_EXT_samplerless_texture_functions : require
+
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(binding = 0) uniform texture2D flow_tex; // 1x1: the car's vector in half size pixels
+layout(binding = 1, rg16f) uniform writeonly image2D mv_img;
+layout(binding = 2) uniform texture2D mask_tex; // 1: pixels that move on their own
+
+layout(push_constant) uniform Constants {
+    ivec2 mot_size;
+    ivec2 flow_size;
+    vec2 pic_size;
+    float zero;       // 1: no previous picture
+    float normalized; // 1: screen fractions (DLSS), 0: pixels (FSR)
+};
+
+void main() {
+    const ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (any(greaterThanEqual(p, mot_size))) {
+        return;
+    }
+    // Only the player's car has a vector of its own; everything else keeps the camera's.
+    if (texelFetch(mask_tex, p, 0).r < 0.75) {
+        return;
+    }
+    if (zero > 0.5) {
+        imageStore(mv_img, p, vec4(0.0));
+        return;
+    }
+    const vec2 d = texelFetch(flow_tex, ivec2(0), 0).rg * 2.0 * vec2(mot_size) / pic_size;
+    imageStore(mv_img, p, vec4(normalized > 0.5 ? d / vec2(mot_size) : d, 0.0, 0.0));
+}

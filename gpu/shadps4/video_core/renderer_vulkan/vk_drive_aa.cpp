@@ -365,7 +365,8 @@ void DriveAA::OnTaa(VideoCore::ImageId color_id, VideoCore::ImageId depth_id,
             all, rw);
 
     // Camera motion in render pixels (previous minus current).
-    motion.Record(cmdbuf, depth_view, *motion_view, w, h, w, h, false);
+    // No stencil here: the anti-aliasing keeps the camera's vectors for every pixel, as before.
+    motion.Record(cmdbuf, depth_view, depth_view, *motion_view, w, h, w, h, false);
     barrier(vk::Image(motion_image), vk::ImageLayout::eGeneral,
             vk::PipelineStageFlagBits2::eComputeShader, vk::AccessFlagBits2::eShaderWrite, all,
             vk::AccessFlagBits2::eShaderRead);

@@ -158,6 +158,9 @@ public:
         return depth_clip_control;
     }
 
+    /// Prints what is known about a lost device (recent work, memory, driver fault report).
+    void LogDeviceLost() const;
+
     /// Returns true when VK_EXT_depth_clip_enable is supported
     bool IsDepthClipEnableSupported() const {
         return depth_clip_enable;
@@ -248,8 +251,30 @@ public:
     }
 
     /// Returns true if the subgroup size can be set to match guest subgroup size
+    /// bbport: in every stage the game's shaders use. AMD reports 64-wide subgroups but lets the
+    /// size be required only for compute: requiring 64 in the graphics stages was invalid, and the
+    /// shaders were compiled for 64 lanes but ran at the driver's own width (random colored fog
+    /// and characters). Those cards use the 32-wide path, which
+    /// NVIDIA runs: compute pinned to 32 and the recompiler lowering wave64 code for 32 lanes.
     bool IsSubgroupSize64Supported() const {
-        return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64;
+        constexpr auto stages = vk::ShaderStageFlagBits::eVertex |
+                                vk::ShaderStageFlagBits::eFragment |
+                                vk::ShaderStageFlagBits::eCompute;
+        return vk13_features.subgroupSizeControl && vk13_props.maxSubgroupSize >= 64 &&
+               (vk13_props.requiredSubgroupSizeStages & stages) == stages;
+    }
+
+    /// True when compute shaders must be pinned to 32-wide subgroups: the device could run them
+    /// wider, but the recompiler lowers wave64 code for 32 lanes.
+    bool IsComputeSubgroupSize32Required() const {
+        return !IsSubgroupSize64Supported() && vk13_features.subgroupSizeControl &&
+               vk13_props.minSubgroupSize <= 32 && vk13_props.maxSubgroupSize > 32 &&
+               bool(vk13_props.requiredSubgroupSizeStages & vk::ShaderStageFlagBits::eCompute);
+    }
+
+    /// Whether the driver lets a subgroup size be required for this stage.
+    bool CanRequireSubgroupSize(vk::ShaderStageFlagBits stage) const {
+        return bool(vk13_props.requiredSubgroupSizeStages & stage);
     }
 
     /// Returns true when VK_KHR_workgroup_memory_explicit_layout is supported.
@@ -366,6 +391,12 @@ public:
 
     /// Returns the subgroup size of the selected physical device.
     u32 SubgroupSize() const {
+        if (IsSubgroupSize64Supported()) {
+            return 64;
+        }
+        if (IsComputeSubgroupSize32Required()) {
+            return 32;
+        }
         return vk11_props.subgroupSize;
     }
 
@@ -547,6 +578,8 @@ private:
     bool amd_shader_explicit_vertex_parameter{};
     bool depth_clip_control{};
     bool depth_clip_enable{};
+    bool device_fault{};
+    bool device_fault_vendor_binary{};
     bool dynamic_state_3{};
     bool depth_range_unrestricted{};
     bool vertex_input_dynamic_state{};

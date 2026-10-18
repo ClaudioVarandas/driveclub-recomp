@@ -13,6 +13,7 @@
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_dlss.h"
+#include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
 
@@ -183,6 +184,7 @@ Instance::Instance(const Frontend::WindowSystemInfo& window_info, s32 physical_d
     format_properties = GetFormatProperties(physical_device);
     properties = physical_device.getProperties();
     memory_properties = physical_device.getMemoryProperties();
+    VideoCore::SetStreamPlacementDefault(properties.vendorID);
     {
         const auto chain = physical_device.getProperties2<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceDriverProperties>();
         const auto& driver_properties = chain.get<vk::PhysicalDeviceDriverProperties>();
@@ -329,7 +331,30 @@ bool Instance::CreateDevice() {
     custom_border_color = add_extension(VK_EXT_CUSTOM_BORDER_COLOR_EXTENSION_NAME);
     depth_clip_control = add_extension(VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME);
     depth_clip_enable = add_extension(VK_EXT_DEPTH_CLIP_ENABLE_EXTENSION_NAME);
-    vertex_input_dynamic_state = add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+    // bbport: after a lost device the driver can say which address faulted and give its own
+    // crash data; LogDeviceLost() writes it to the log. Optional, nothing depends on it.
+    device_fault = add_extension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    if (device_fault) {
+        vk::PhysicalDeviceFaultFeaturesEXT fault_query{};
+        vk::PhysicalDeviceFeatures2 query{.pNext = &fault_query};
+        physical_device.getFeatures2(&query);
+        device_fault = fault_query.deviceFault;
+        device_fault_vendor_binary = fault_query.deviceFaultVendorBinary;
+    }
+    std::printf("GPU: driver fault report after a lost device: %s%s\n", device_fault ? "available" : "not available",
+                device_fault_vendor_binary ? " (with driver crash data)" : "");
+    // bbport: Intel's drivers draw characters as black silhouettes with this extension (seen in
+    // Arc and HD 630 drivers); the game then builds its vertex input statically.
+    // BB_VERTEX_INPUT_DYNAMIC_STATE=0/1 forces it either way.
+    {
+        const char* env = std::getenv("BB_VERTEX_INPUT_DYNAMIC_STATE");
+        const bool want = env ? env[0] != '0' : properties.vendorID != 0x8086;
+        vertex_input_dynamic_state = want && add_extension(VK_EXT_VERTEX_INPUT_DYNAMIC_STATE_EXTENSION_NAME);
+        if (!want) {
+            std::printf("GPU: vertex input dynamic state off (%s)\n",
+                        env ? "BB_VERTEX_INPUT_DYNAMIC_STATE=0" : "Intel driver");
+        }
+    }
     list_restart = add_extension(VK_EXT_PRIMITIVE_TOPOLOGY_LIST_RESTART_EXTENSION_NAME);
     if (list_restart) {
         list_restart_features =
@@ -437,6 +462,12 @@ bool Instance::CreateDevice() {
     const auto vk11_features = feature_chain.get<vk::PhysicalDeviceVulkan11Features>();
     vk12_features = feature_chain.get<vk::PhysicalDeviceVulkan12Features>();
     vk13_features = feature_chain.get<vk::PhysicalDeviceVulkan13Features>();
+    std::printf("GPU: subgroup sizes %u to %u (default %u), size can be required in stages %#x; recompiler targets %u wide%s\n",
+                vk13_props.minSubgroupSize, vk13_props.maxSubgroupSize, vk11_props.subgroupSize,
+                unsigned(VkShaderStageFlags(vk13_props.requiredSubgroupSizeStages)), SubgroupSize(),
+                IsSubgroupSize64Supported() ? ", compute and graphics pinned to 64"
+                : IsComputeSubgroupSize32Required() ? ", compute pinned to 32"
+                                                    : "");
     // bbport: DLSS (optional bridge DLL) needs its own device extensions on NVIDIA GPUs.
     std::vector<const char*> dlss_extensions;
     if (Dlss* dlss = Dlss::Get()) {
@@ -539,6 +570,10 @@ bool Instance::CreateDevice() {
             .robustImageAccess2 = true,
             .nullDescriptor = true,
         },
+        vk::PhysicalDeviceFaultFeaturesEXT{
+            .deviceFault = device_fault,
+            .deviceFaultVendorBinary = device_fault_vendor_binary,
+        },
         vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT{
             .vertexInputDynamicState = true,
         },
@@ -615,6 +650,9 @@ bool Instance::CreateDevice() {
     }
     if (!depth_clip_enable) {
         device_chain.unlink<vk::PhysicalDeviceDepthClipEnableFeaturesEXT>();
+    }
+    if (!device_fault) {
+        device_chain.unlink<vk::PhysicalDeviceFaultFeaturesEXT>();
     }
     if (!vertex_input_dynamic_state) {
         device_chain.unlink<vk::PhysicalDeviceVertexInputDynamicStateFeaturesEXT>();
@@ -928,6 +966,75 @@ vk::Format Instance::GetSupportedFormat(const vk::Format format,
         }
     }
     return format;
+}
+
+extern "C" void bbgpu_print_recent_passes(void);
+extern "C" void bbgpu_note_device_lost(void);
+extern "C" const char* bbgpu_sibling_path(const char* name);
+
+// bbport: everything the driver and the process can say about a lost device, written once.
+void Instance::LogDeviceLost() const {
+    const auto line = [](const std::string& text) {
+        std::fputs(text.c_str(), stdout);
+        std::fputc(10, stdout);
+    };
+    bbgpu_print_recent_passes();
+    bbgpu_note_device_lost();
+    vk::PhysicalDeviceMemoryBudgetPropertiesEXT budget{};
+    vk::PhysicalDeviceMemoryProperties2 props = {.pNext = supports_memory_budget ? &budget : nullptr};
+    physical_device.getMemoryProperties2(&props);
+    for (u32 i = 0; i < props.memoryProperties.memoryHeapCount; ++i) {
+        const auto& heap = props.memoryProperties.memoryHeaps[i];
+        line(fmt::format("GPU: device lost, heap {}: {} {} MiB, in use {} MiB of {} MiB budget", i,
+                         (heap.flags & vk::MemoryHeapFlagBits::eDeviceLocal) ? "device local" : "host",
+                         heap.size >> 20, supports_memory_budget ? budget.heapUsage[i] >> 20 : 0,
+                         supports_memory_budget ? budget.heapBudget[i] >> 20 : 0));
+    }
+    if (!device_fault) {
+        line("GPU: device lost, the driver gives no fault report (VK_EXT_device_fault missing)");
+        std::fflush(stdout);
+        return;
+    }
+    vk::DeviceFaultCountsEXT counts{};
+    if (device->getFaultInfoEXT(&counts, nullptr) != vk::Result::eSuccess) {
+        line("GPU: device lost, the fault report could not be read");
+        std::fflush(stdout);
+        return;
+    }
+    std::vector<vk::DeviceFaultAddressInfoEXT> addresses(counts.addressInfoCount);
+    std::vector<vk::DeviceFaultVendorInfoEXT> vendors(counts.vendorInfoCount);
+    std::vector<u8> binary(device_fault_vendor_binary ? counts.vendorBinarySize : 0);
+    vk::DeviceFaultInfoEXT info{};
+    info.pAddressInfos = addresses.data();
+    info.pVendorInfos = vendors.data();
+    info.pVendorBinaryData = binary.empty() ? nullptr : binary.data();
+    counts.vendorBinarySize = binary.size();
+    if (device->getFaultInfoEXT(&counts, &info) != vk::Result::eSuccess) {
+        line("GPU: device lost, the fault report could not be read");
+        std::fflush(stdout);
+        return;
+    }
+    line(fmt::format("GPU: device fault: {}", info.description.data()));
+    for (const auto& a : addresses) {
+        line(fmt::format("GPU: device fault address: {} 0x{:x} precision 0x{:x}",
+                         vk::to_string(a.addressType), u64(a.reportedAddress), u64(a.addressPrecision)));
+    }
+    for (const auto& v : vendors) {
+        line(fmt::format("GPU: device fault vendor: {} code 0x{:x} data 0x{:x}", v.description.data(),
+                         u64(v.vendorFaultCode), u64(v.vendorFaultData)));
+    }
+    if (!binary.empty()) {
+        const char* path = bbgpu_sibling_path("gpu_fault_vendor.bin");
+        if (path && *path) {
+            if (FILE* f = std::fopen(path, "wb")) {
+                std::fwrite(binary.data(), 1, binary.size(), f);
+                std::fclose(f);
+                line(fmt::format("GPU: device fault: {} bytes of driver crash data saved to {}",
+                                 binary.size(), path));
+            }
+        }
+    }
+    std::fflush(stdout);
 }
 
 } // namespace Vulkan

@@ -67,6 +67,8 @@ The window that opens when you start `DriveClub.exe` has every setting. Press **
 
 **Anti-aliasing:** **Game** keeps the original. **FSR 3.1** works on any graphics card, **DLAA (RTX)** needs a GeForce RTX card; if it is not available the launcher falls back to FSR. Do not turn on the community patch "Disable motion blur and depth of field" with it: they do not work together and the game keeps its own anti-aliasing then.
 
+**Anisotropic filtering:** keeps textures on roads and terrain sharp at a shallow angle. **Automatic** is 16x (4x on integrated graphics); you can also choose Off, 2x, 4x, 8x or 16x.
+
 **Unlock DLC content:** off by default. Unlocks the add-on cars, bikes, tours and livery decals. The launcher reads the vehicle list, the tour list and the livery list from your own game archive and builds changed copies that the game uses. Your game folders are not modified.
 
 **Gameplay:** player name, borderless fullscreen, FPS counter, motion blur and depth of field off, no reset-to-track timer, no track barriers, and photo mode options.
@@ -80,7 +82,7 @@ The window that opens when you start `DriveClub.exe` has every setting. Press **
 - **The processor is the limit.** Heavy scenes (many cars, trees and rain) drop frames first on slower CPUs.
 - **First play builds shaders:** short stutters in the first minutes until they are cached. This gets better on later runs.
 - **Online features do not work.**
-- Tested on an NVIDIA graphics card only. AMD and Intel are untested.
+- Tested on an NVIDIA graphics card only. AMD and Intel are untested; reports from AMD and Intel players are welcome.
 
 ## Notes
 - You must supply your own, legally obtained dump of the game. No game files are included.

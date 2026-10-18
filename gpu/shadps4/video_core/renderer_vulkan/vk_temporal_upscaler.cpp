@@ -2040,9 +2040,14 @@ void TemporalUpscaler::CaptureFrameGen(VideoCore::ImageId depth_id, u64 address)
         CachedView(depth, depth.info.pixel_format, vk::ImageAspectFlagBits::eDepth);
     runtime.Transit(&depth, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
                     vk::AccessFlagBits2::eShaderRead);
+    // The stencil of the scene depth marks the player's car.
+    const vk::ImageView stencil_view =
+        depth.info.pixel_format == vk::Format::eD32SfloatS8Uint
+            ? CachedView(depth, depth.info.pixel_format, vk::ImageAspectFlagBits::eStencil)
+            : depth_view;
     runtime.FlushBarriers();
     const auto cmdbuf = scheduler.CommandBuffer();
-    if (const vk::ImageView motion = frame_generator->BeginCapture(cmdbuf, depth_view, w, h, address)) {
+    if (const vk::ImageView motion = frame_generator->BeginCapture(cmdbuf, depth_view, stencil_view, w, h, address)) {
         // The camera of the game's own anti-aliasing pass; without it (menus) the motion is zero
         // and the optical flow of the frame generation estimates it.
         FrameGenCamera camera{};
@@ -2053,8 +2058,15 @@ void TemporalUpscaler::CaptureFrameGen(VideoCore::ImageId depth_id, u64 address)
         const bool have_camera = drive_motion->Ready();
         if (have_camera) {
             // DLSS takes screen fractions (its scale is 1), FSR takes pixels.
-            const auto size = frame_generator->InputSize();
-            drive_motion->Record(cmdbuf, depth_view, motion, size[0], size[1], w, h, dlss);
+            // FSR 3.1 finds the motion itself and was cleaner (no ghosts on the cars) with no
+            // vectors from the game than with the camera's (BB_FG_CAMERA_MV=1: the camera's).
+            static const bool camera_vectors = std::getenv("BB_FG_CAMERA_MV") != nullptr;
+            if (dlss || camera_vectors) {
+                const auto size = frame_generator->InputSize();
+                drive_motion->Record(cmdbuf, depth_view, stencil_view, motion, size[0], size[1], w, h, dlss);
+            } else {
+                frame_generator->ZeroMotion(cmdbuf);
+            }
             camera.near_plane = drive_motion->Near();
             camera.vertical_fov = drive_motion->VerticalFov();
             drive_motion->ClipTransforms(camera.view_to_clip, camera.clip_to_prev_clip,

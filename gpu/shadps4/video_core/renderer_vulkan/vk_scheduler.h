@@ -759,10 +759,9 @@ public:
             func(current_cmdbuf);
             return;
         }
-        if (!record_chunk->Push(std::forward<Func>(func))) {
-            full_chunks.push_back(std::move(record_chunk));
-            record_chunk = AcquireChunk();
-            const bool pushed = record_chunk->Push(std::forward<Func>(func));
+        if (!CurrentChunk().Push(std::forward<Func>(func))) {
+            RetireChunk();
+            const bool pushed = CurrentChunk().Push(std::forward<Func>(func));
             ASSERT(pushed);
         }
     }
@@ -779,9 +778,8 @@ public:
         if (!IsRecordingDeferred() || bytes + 1024 > RecordChunk::Capacity) {
             return; // too large for a chunk: RecordData() puts it in the chunk's overflow storage
         }
-        if (RecordChunk::Capacity - record_chunk->Size() < bytes + 1024) {
-            full_chunks.push_back(std::move(record_chunk));
-            record_chunk = AcquireChunk();
+        if (RecordChunk::Capacity - CurrentChunk().Size() < bytes + 1024) {
+            RetireChunk();
         }
     }
 
@@ -796,12 +794,12 @@ public:
         const size_t bytes = data.size_bytes();
         if (bytes + alignof(T) + 1024 > RecordChunk::Capacity) {
             static_assert(alignof(T) <= alignof(std::max_align_t));
-            auto* big = static_cast<T*>(record_chunk->AllocateOverflow(bytes));
+            auto* big = static_cast<T*>(CurrentChunk().AllocateOverflow(bytes));
             std::memcpy(big, data.data(), bytes);
             return {big, data.size()};
         }
         ReserveRecordData(bytes + alignof(T));
-        auto* dst = static_cast<T*>(record_chunk->Allocate(bytes, alignof(T)));
+        auto* dst = static_cast<T*>(CurrentChunk().Allocate(bytes, alignof(T)));
         std::memcpy(dst, data.data(), bytes);
         return {dst, data.size()};
     }
@@ -897,6 +895,26 @@ private:
     void AllocateWorkerCommandBuffers();
 
     std::unique_ptr<RecordChunk> AcquireChunk();
+
+    /// Moves the full current chunk aside; a new one takes its place, swapped in first so the
+    /// current chunk is never null, not even for a fault handler that records on this thread
+    /// meanwhile (the draw pipeline's recording thread handles its page faults inline: a null
+    /// chunk there crashed with a read at address 0x20018, RecordChunk::Allocate).
+    void RetireChunk() {
+        auto full = AcquireChunk();
+        record_chunk.swap(full);
+        if (full) {
+            full_chunks.push_back(std::move(full));
+        }
+    }
+
+    /// The current chunk, never null (a null one is replaced here).
+    RecordChunk& CurrentChunk() {
+        if (!record_chunk) [[unlikely]] {
+            record_chunk = AcquireChunk();
+        }
+        return *record_chunk;
+    }
 
     void RecorderThread(std::stop_token stoken);
 

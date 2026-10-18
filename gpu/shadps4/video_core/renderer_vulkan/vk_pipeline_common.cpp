@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <chrono>
+#include <thread>
 #include <memory>
 #include <span>
 #include <vector>
@@ -23,6 +25,21 @@ Pipeline::Pipeline(const Instance& instance_, Scheduler& scheduler_, DescriptorH
       is_compute{is_compute_} {}
 
 Pipeline::~Pipeline() = default;
+
+bool RetryPipelineCreation(vk::Result result, u32 attempt, const char* kind, const char* name) {
+    constexpr u32 MaxAttempts = 5;
+    const bool may_recover = result == vk::Result::eErrorUnknown ||
+                             result == vk::Result::eErrorOutOfHostMemory ||
+                             result == vk::Result::eErrorOutOfDeviceMemory ||
+                             result == vk::Result::eErrorInitializationFailed;
+    if (!may_recover || attempt >= MaxAttempts) {
+        return false;
+    }
+    LOG_WARNING(Render_Vulkan, "Creating {} pipeline {} failed with {} (attempt {}), trying again",
+                kind, name, vk::to_string(result), attempt);
+    std::this_thread::sleep_for(std::chrono::milliseconds{100} * attempt);
+    return true;
+}
 
 
 void Pipeline::BindResources(DescriptorWrites& set_writes,
